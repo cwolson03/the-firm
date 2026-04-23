@@ -1,0 +1,24 @@
+# Credentials
+.env
+*.pem
+*.key
+config/
+logs/
+*.log
+
+# Runtime data
+data/*.json
+status/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+*.swp
