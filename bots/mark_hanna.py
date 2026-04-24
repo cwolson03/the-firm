@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 # ── Config ─────────────────────────────────────────────────────────────────
-TOKENS_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.env')
+TOKENS_FILE = os.path.join(os.path.dirname(__file__), '..', 'config', 'bot-tokens.env')
 load_dotenv(TOKENS_FILE)
 
 MARK_HANNA_TOKEN = os.getenv('MARK_HANNA_TOKEN')
@@ -28,7 +28,7 @@ CHANNEL_MACRO        = 1487189080482648095
 CHANNEL_BOT_LOGS     = 1487189090817282139
 
 # State file to track which topic was last researched
-STATE_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data', 'mark_hanna_state.json')
+STATE_FILE = os.path.join(os.path.dirname(__file__), '..', 'config', 'mark_hanna_state.json')
 
 # Research queue — rotate through these weekly
 RESEARCH_QUEUE = [

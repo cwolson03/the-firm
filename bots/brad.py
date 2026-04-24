@@ -67,14 +67,17 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 BRAD_PAPER_MODE = True  # Set to False only when Cody explicitly authorizes live trading
 
 KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
-KEY_ID = os.environ.get("KALSHI_KEY_ID", "")
+KEY_ID      = "28aebab3-8694-46bc-95f1-2d37d9e9266e"
 
-# Paths — resolved from environment
-PRIVATE_KEY_PATH = os.environ.get("KALSHI_PRIVATE_KEY_PATH", "")
-BOT_TOKENS_ENV   = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
-_LOG_DIR = os.path.join(os.environ.get("FIRM_BASE_DIR", os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "logs")
-os.makedirs(_LOG_DIR, exist_ok=True)
-LOG_PATH = os.path.join(_LOG_DIR, "brad.log")
+# Paths — auto-detect Atlas (cody) vs local (stratton)
+if os.path.exists("/home/cody/stratton"):
+    PRIVATE_KEY_PATH = "/home/cody/stratton/config/kalshi_private.pem"
+    BOT_TOKENS_ENV   = "/home/cody/stratton/config/bot-tokens.env"
+    LOG_PATH         = "/home/cody/stratton/logs/brad.log"
+else:
+    PRIVATE_KEY_PATH = "/home/stratton/.openclaw/workspace/config/kalshi_private.pem"
+    BOT_TOKENS_ENV   = "/home/stratton/.openclaw/workspace/config/bot-tokens.env"
+    LOG_PATH         = "/home/stratton/.openclaw/workspace/logs/brad.log"
 
 BRAD_DISCORD_CH  = 1491861968355590242   # #sports-signals
 BRAD_DISCORD_CH2 = 1491861971635540108   # #promo-tracker
@@ -158,7 +161,10 @@ MAX_DAYS_UNTIL_CLOSE = 7       # S1/S2: only bid on markets closing within 7 day
 MIN_MARKET_VOLUME    = 50      # minimum volume to consider a market (lowered for IPL/tennis)
 
 # ── Paper trading ─────────────────────────────────────────────────────────────
-PAPER_TRADES_FILE = os.path.join(os.environ.get("FIRM_BASE_DIR", os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "data", "brad_paper_trades.json")
+if os.path.exists("/home/cody/stratton"):
+    PAPER_TRADES_FILE = "/home/cody/stratton/data/brad_paper_trades.json"
+else:
+    PAPER_TRADES_FILE = "/home/stratton/.openclaw/workspace/data/brad_paper_trades.json"
 
 # ── ESPN scoreboard URLs ──────────────────────────────────────────────────────
 ESPN_SCOREBOARDS = {

@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 
 # ── Config ─────────────────────────────────────────────────────────────────
-TOKENS_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.env')
+TOKENS_FILE = os.path.join(os.path.dirname(__file__), '..', 'config', 'bot-tokens.env')
 load_dotenv(TOKENS_FILE)
 
 CHESTER_TOKEN = os.getenv('CHESTER_TOKEN')

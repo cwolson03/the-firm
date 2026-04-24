@@ -3,7 +3,7 @@
 WEATHER MARKET BACKTEST — Stratton Oakmont
 ==========================================
 Two data sources:
-  1. PAPER TRADES: $FIRM_BASE_DIR/data/weather_paper_trades.json
+  1. PAPER TRADES: /home/cody/stratton/data/weather_paper_trades.json
      - Has real Kalshi prices at signal time (760+ settled trades, Apr 16-21)
      - Use this for actual trading performance analysis
   2. KALSHI FINALIZED + OPEN-METEO (last 2 days with previous_* price fields)
@@ -38,9 +38,9 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 # ─────────────────────────────────────────────────────────────────────────────
 
 KALSHI_BASE      = "https://api.elections.kalshi.com/trade-api/v2"
-KEY_ID = os.environ.get("KALSHI_KEY_ID", "")
-PRIVATE_KEY_PATH = os.environ.get("KALSHI_PRIVATE_KEY_PATH", "")
-DATA_DIR = os.path.join(os.environ.get("FIRM_BASE_DIR", os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "data")
+KEY_ID           = "28aebab3-8694-46bc-95f1-2d37d9e9266e"
+PRIVATE_KEY_PATH = "/home/cody/stratton/config/kalshi_private.pem"
+DATA_DIR         = "/home/cody/stratton/data"
 
 RAW_CACHE_FILE      = os.path.join(DATA_DIR, "backtest_raw.json")
 RESULTS_FILE        = os.path.join(DATA_DIR, "backtest_results.json")

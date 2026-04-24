@@ -54,14 +54,16 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 # PATH DETECTION — Atlas vs local
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Paths — resolved from environment
-PRIVATE_KEY_PATH  = os.environ.get("KALSHI_PRIVATE_KEY_PATH", "")
-BOT_TOKENS_ENV    = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
-_BASE_DIR = os.environ.get("FIRM_BASE_DIR", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-_LOG_DIR = os.path.join(_BASE_DIR, "logs")
-os.makedirs(_LOG_DIR, exist_ok=True)
-LOG_PATH          = os.path.join(_LOG_DIR, "weather.log")
-DATA_DIR          = os.path.join(_BASE_DIR, "data")
+if os.path.exists("/home/cody/stratton"):
+    PRIVATE_KEY_PATH  = "/home/cody/stratton/config/kalshi_private.pem"
+    BOT_TOKENS_ENV    = "/home/cody/stratton/config/bot-tokens.env"
+    LOG_PATH          = "/home/cody/stratton/logs/weather.log"
+    DATA_DIR          = "/home/cody/stratton/data"
+else:
+    PRIVATE_KEY_PATH  = "/home/stratton/.openclaw/workspace/config/kalshi_private.pem"
+    BOT_TOKENS_ENV    = "/home/stratton/.openclaw/workspace/config/bot-tokens.env"
+    LOG_PATH          = "/home/stratton/.openclaw/workspace/logs/weather.log"
+    DATA_DIR          = "/home/stratton/.openclaw/workspace/data"
 
 BLOCKS_FILE               = os.path.join(DATA_DIR, "weather_blocks.json")
 WEATHER_PAPER_TRADES_FILE = os.path.join(DATA_DIR, "weather_paper_trades.json")
@@ -81,8 +83,8 @@ BIAS_MIN_SAMPLES          = 3     # minimum samples before applying correction
 # ─────────────────────────────────────────────────────────────────────────────
 
 KALSHI_BASE      = "https://api.elections.kalshi.com/trade-api/v2"
-KEY_ID = os.environ.get("KALSHI_KEY_ID", "")
-TOMORROW_API_KEY = os.environ.get("TOMORROW_API_KEY", "")
+KEY_ID           = "28aebab3-8694-46bc-95f1-2d37d9e9266e"
+TOMORROW_API_KEY = os.environ.get("TOMORROW_API_KEY", "ojJ8eI5GY3gaGHwXkvtHoA5sE0rygpGz")
 
 # Discord — #mark-signals
 WEATHER_CHANNEL = 1491861985162432634

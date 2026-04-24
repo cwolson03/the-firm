@@ -16,7 +16,7 @@ Checks:
   6. GDP T2.0 stop-loss (KXGDP-26APR30-T2.0 NO price below 50¢)
 
 State:
-  $FIRM_BASE_DIR/data/supervisor_state.json
+  /home/cody/stratton/data/supervisor_state.json
 
 Usage:
     python3 supervisor.py --once     # single check + exit
@@ -44,23 +44,28 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CONFIG — paths resolved from environment variables (see .env.example)
+# CONFIG — path auto-detect (Atlas = /home/cody, local = /home/stratton)
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Paths — resolved from environment
-PRIVATE_KEY_PATH = os.environ.get("KALSHI_PRIVATE_KEY_PATH", "")
-BOT_TOKENS_ENV   = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
-_BASE_DIR = os.environ.get("FIRM_BASE_DIR", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-_LOG_DIR = os.path.join(_BASE_DIR, "logs")
-os.makedirs(_LOG_DIR, exist_ok=True)
-LOG_PATH         = os.path.join(_LOG_DIR, "supervisor.log")
-FIRM_LOG_PATH    = os.path.join(_LOG_DIR, "firm.log")
-STATE_FILE       = os.path.join(_BASE_DIR, "data", "supervisor_state.json")
-BRAD_PY_PATH     = os.path.join(_BASE_DIR, "agents", "brad.py")
-WEATHER_PY_PATH  = os.path.join(_BASE_DIR, "agents", "weather.py")
+if os.path.exists("/home/cody/stratton"):
+    PRIVATE_KEY_PATH = "/home/cody/stratton/config/kalshi_private.pem"
+    BOT_TOKENS_ENV   = "/home/cody/stratton/config/bot-tokens.env"
+    LOG_PATH         = "/home/cody/stratton/logs/supervisor.log"
+    FIRM_LOG_PATH    = "/home/cody/stratton/config/firm.log"
+    STATE_FILE       = "/home/cody/stratton/data/supervisor_state.json"
+    BRAD_PY_PATH     = "/home/cody/stratton/bots/brad.py"
+    WEATHER_PY_PATH  = "/home/cody/stratton/bots/weather.py"
+else:
+    PRIVATE_KEY_PATH = "/home/stratton/.openclaw/workspace/config/kalshi_private.pem"
+    BOT_TOKENS_ENV   = "/home/stratton/.openclaw/workspace/config/bot-tokens.env"
+    LOG_PATH         = "/home/stratton/.openclaw/workspace/logs/supervisor.log"
+    FIRM_LOG_PATH    = "/home/stratton/.openclaw/workspace/config/firm.log"
+    STATE_FILE       = "/home/stratton/.openclaw/workspace/data/supervisor_state.json"
+    BRAD_PY_PATH     = "/home/stratton/.openclaw/workspace/research/brad.py"
+    WEATHER_PY_PATH  = "/home/stratton/.openclaw/workspace/research/weather.py"
 
 KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
-KEY_ID = os.environ.get("KALSHI_KEY_ID", "")
+KEY_ID      = "28aebab3-8694-46bc-95f1-2d37d9e9266e"
 
 GENERAL_CHANNEL = 1491861935354810453   # #general
 ALERT_COOLDOWN_HOURS = 2                # don't repeat the same alert within 2 hours
@@ -269,18 +274,17 @@ def check_firm_service(state: dict) -> Optional[str]:
     Returns alert message if down, else None.
     """
     log.info("[Check 1] Firm service health...")
-    # Only run this check if running under systemd (service name configurable)
-    service_name = os.environ.get("FIRM_SERVICE_NAME", "stratton-firm")
-    if not service_name:
-        log.info("  FIRM_SERVICE_NAME not set — skipping service check")
+    # Only run this check on Atlas where the service actually exists
+    if not os.path.exists("/home/cody/stratton"):
+        log.info("  Not on Atlas — skipping service check")
         return None
     try:
         result = subprocess.run(
-            ['systemctl', 'is-active', service_name],
+            ['systemctl', 'is-active', 'stratton-firm'],
             capture_output=True, text=True, timeout=10
         )
         status = result.stdout.strip()
-        log.info(f"  {service_name}.service: {status}")
+        log.info(f"  stratton-firm.service: {status}")
         if status != 'active':
             key = "firm_service_down"
             if should_send_alert(state, key):

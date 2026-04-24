@@ -69,14 +69,18 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 # ─────────────────────────────────────────────────────────────────────────────
 
 KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
-KEY_ID = os.environ.get("KALSHI_KEY_ID", "")
+KEY_ID      = "28aebab3-8694-46bc-95f1-2d37d9e9266e"
 
-# Paths — resolved from environment
-PRIVATE_KEY_PATH = os.environ.get("KALSHI_PRIVATE_KEY_PATH", "")
-BOT_TOKENS_ENV   = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
-_LOG_DIR = os.path.join(os.environ.get("FIRM_BASE_DIR", os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "logs")
-os.makedirs(_LOG_DIR, exist_ok=True)
-LOG_PATH = os.path.join(_LOG_DIR, "donnie.log")
+# Paths — auto-detect Atlas (cody) vs local (stratton)
+_HOME = os.path.expanduser("~")
+if os.path.exists("/home/cody/stratton"):
+    PRIVATE_KEY_PATH = "/home/cody/stratton/config/kalshi_private.pem"
+    BOT_TOKENS_ENV   = "/home/cody/stratton/config/bot-tokens.env"
+    LOG_PATH         = "/home/cody/stratton/logs/donnie.log"
+else:
+    PRIVATE_KEY_PATH = "/home/stratton/.openclaw/workspace/config/kalshi_private.pem"
+    BOT_TOKENS_ENV   = "/home/stratton/.openclaw/workspace/config/bot-tokens.env"
+    LOG_PATH         = "/home/stratton/.openclaw/workspace/logs/donnie.log"
 
 DISCORD_CH_KALSHI  = 1491861941361180924   # #kalshi-signals
 DISCORD_CH_RESULTS = 1491861943894671450   # #kalshi-results
@@ -932,7 +936,7 @@ def run_weather_refresh(all_markets: list = None, dry_run: bool = False,
 # GDPNOW PROBABILITY CALCULATOR
 # ─────────────────────────────────────────────────────────────────────────────
 
-FRED_API_KEY = os.environ.get("FRED_API_KEY", "")
+FRED_API_KEY = os.environ.get("FRED_API_KEY", "c642f045085a5318c95d0f38d44b42d2")
 
 def fetch_fred_series(series_id: str) -> Optional[float]:
     """Fetch latest value from any FRED series using the API key."""

@@ -15,9 +15,16 @@ from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 
 # ── Config ─────────────────────────────────────────────────────────────────
-TOKENS_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.env')
-SEEN_FILE   = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data', 'rugrat_seen.json')
+TOKENS_FILE = os.path.join(os.path.dirname(__file__), '..', 'config', 'bot-tokens.env')
+SEEN_FILE   = os.path.join(os.path.dirname(__file__), '..', 'config', 'rugrat_seen.json')
 load_dotenv(TOKENS_FILE)
+
+# ── Shared context (optional) ───────────────────────────────────────────────
+try:
+    from shared_context import write_agent_status as _write_status
+except ImportError:
+    def _write_status(name, d): pass
+
 
 RUGRAT_TOKEN = os.getenv('RUGRAT_TOKEN')
 
@@ -856,6 +863,10 @@ def run_recent(demo: bool = False, post: bool = True):
     print(f"[RUGRAT] Recent scan complete. {len(processed)} new trades processed.")
     if not processed:
         print("[RUGRAT] No new trades from watched members in last 24h.")
+    _write_status('rugrat', {
+        'mode': 'recent_scan',
+        'trades_processed': len(processed),
+    })
 
 
 def run_member(member_query: str, demo: bool = False):

@@ -20,16 +20,7 @@ import threading
 import importlib.util
 import requests
 from datetime import datetime, timezone
-from logging.handlers import RotatingFileHandler
 from dotenv import load_dotenv
-
-# ── Config ─────────────────────────────────────────────────────────────────
-BASE_DIR = os.environ.get("FIRM_BASE_DIR", os.path.dirname(os.path.abspath(__file__)))
-AGENTS_DIR = os.path.join(BASE_DIR, "agents")
-TOOLS_DIR  = os.path.join(BASE_DIR, "tools")
-LOGS_DIR   = os.path.join(BASE_DIR, "logs")
-
-os.makedirs(LOGS_DIR, exist_ok=True)
 
 # ── Logging ─────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -37,62 +28,62 @@ logging.basicConfig(
     format='[%(asctime)s] %(levelname)s [%(name)s] %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout),
-        RotatingFileHandler(
-            os.path.join(LOGS_DIR, 'firm.log'),
-            maxBytes=5 * 1024 * 1024,  # 5MB
-            backupCount=3,
-        ),
+        logging.FileHandler(os.path.join(os.path.dirname(__file__), '..', 'config', 'firm.log')),
     ]
 )
 log = logging.getLogger('FIRM')
 
-# ── Load environment ─────────────────────────────────────────────────────────
-load_dotenv(os.path.join(BASE_DIR, '.env'))
+# ── Config ─────────────────────────────────────────────────────────────────
+BOT_DIR    = os.path.dirname(os.path.abspath(__file__))
+TOKENS_FILE = os.path.join(BOT_DIR, '..', 'config', 'bot-tokens.env')
+load_dotenv(TOKENS_FILE)
 
-STRATTON_TOKEN   = os.getenv('STRATTON_TOKEN', '')
-DONNIE_TOKEN     = os.getenv('DONNIE_TOKEN', '')
-RUGRAT_TOKEN     = os.getenv('RUGRAT_TOKEN', '')
-CHESTER_TOKEN    = os.getenv('CHESTER_TOKEN', '')
-JORDAN_TOKEN     = os.getenv('JORDAN_TOKEN', '')
-BRAD_TOKEN       = os.getenv('BRAD_TOKEN', '')
+STRATTON_TOKEN  = os.getenv('STRATTON_TOKEN', '')
+DONNIE_TOKEN    = os.getenv('DONNIE_TOKEN', '')
+RUGRAT_TOKEN    = os.getenv('RUGRAT_TOKEN', '')
+CHESTER_TOKEN   = os.getenv('CHESTER_TOKEN', '')
+JORDAN_TOKEN    = os.getenv('JORDAN_TOKEN', '')
+BRAD_TOKEN      = os.getenv('BRAD_TOKEN', '')
 MARK_HANNA_TOKEN = os.getenv('MARK_HANNA_TOKEN', '')
 
 # ── Channel IDs ─────────────────────────────────────────────────────────────
 CHANNELS = {
-    'kalshi':            1491861941361180924,
-    'polymarket':        1491861941361180924,
-    'sports-betting':    1491861968355590242,
-    'promo-tracker':     1491861971635540108,
-    'crypto-stack':      1491861963016507472,
-    'whale-watch':       1491861959396561166,
-    'senator-tracker':   1491861949615702076,
-    'options-education': 1491861977214222366,
-    'active-plays':      1491861990312906773,
-    'watchlist':         1491861949615702076,
-    'macro-context':     1491861985162432634,
-    'deep-dives':        1491861982209511526,
-    'the-crucible':      1491861982209511526,
-    'daily-brief':       1491185593668079787,
-    'bot-logs':          1491861993022554284,
-    'general':           1491861935354810453,
+    'kalshi':           1491861941361180924,
+    'polymarket':       1491861941361180924,
+    'sports-betting':   1491861968355590242,
+    'promo-tracker':    1491861971635540108,
+    'crypto-stack':     1491861963016507472,
+    'whale-watch':      1491861959396561166,
+    'senator-tracker':  1491861949615702076,
+    'options-education':1491861977214222366,
+    'active-plays':     1491861990312906773,
+    'watchlist':        1491861949615702076,
+    'macro-context':    1491861985162432634,
+    'deep-dives':       1491861982209511526,
+    'the-crucible':     1491861982209511526,
+    'daily-brief':      1491185593668079787,
+    'bot-logs':         1491861993022554284,
+    'general':          1491861935354810453,
 }
 
 # ── Scanner schedule (minutes between runs) ─────────────────────────────────
 SCHEDULE = {
-    'kalshi':     120,    # Donnie: every 2 hours
-    'sports':     30,     # Brad: every 30 min
-    'congress':   240,    # Rugrat: every 4 hours
-    'whale':      30,     # Chester: every 30 min
-    'options':    60,     # Jordan: hourly position check
-    'research':   10080,  # Mark Hanna: weekly (7 days in minutes)
-    'weather':    5,      # Weather bot: every 5 min
-    'supervisor': 30,     # Supervisor heartbeat: every 30 min
+    'kalshi':    120,   # Donnie V2: every 2 hours
+    'sports':    15,    # Brad: every 15 min (matches stink bid refresh cadence)
+    'congress':  240,      # Rugrat: every 4 hours
+    'whale':     999999,   # Chester: every 30 min
+    'options':   15,       # Jordan: price target monitor every 15 min
+    'research':  999999, # Mark Hanna: weekly (7 days in minutes)
+    'weather':   3,      # Weather bot: every 3 minutes
+    'supervisor': 30,   # Supervisor heartbeat: every 30 min
 }
 
 # Track last run timestamps
 _last_run = {k: 0 for k in SCHEDULE}
 _running  = True
-_stop_event = threading.Event()
+
+# Jordan full position-check cadence (separate from fast price-monitor loop)
+_last_full_check = 0   # unix timestamp of last run_position_check() call
 
 # ── Discord post helper ─────────────────────────────────────────────────────
 def post_discord(channel_id: int, content: str, token: str) -> bool:
@@ -137,16 +128,16 @@ def load_module(name: str, path: str):
 
 # ── Scanner runners ──────────────────────────────────────────────────────────
 def run_kalshi_scanner():
-    log.info("[DONNIE] Running Kalshi scan...")
+    log.info("[DONNIE V2] Running Kalshi scan...")
     try:
-        donnie_path = os.path.join(AGENTS_DIR, 'donnie.py')
-        mod = load_module('donnie', donnie_path)
+        donnie_path = os.path.join(BOT_DIR, 'donnie_v2.py')
+        mod = load_module('donnie_v2', donnie_path)
         if mod and hasattr(mod, 'run_scan'):
             mod.run_scan(post=True)
         else:
-            log.warning("[DONNIE] donnie.py has no run_scan() function")
+            log.warning("[DONNIE V2] donnie_v2.py has no run_scan() function")
     except Exception as e:
-        err = f"❌ **DONNIE (Kalshi) FAILED**: {e}"
+        err = f"❌ **DONNIE V2 (Kalshi) FAILED**: {e}"
         log.error(err)
         log_to_discord(err)
 
@@ -154,12 +145,12 @@ def run_kalshi_scanner():
 def run_sports_scanner():
     log.info("[BRAD] Running sports scan...")
     try:
-        sports_path = os.path.join(AGENTS_DIR, 'brad.py')
-        mod = load_module('brad', sports_path)
+        sports_path = os.path.join(BOT_DIR, 'brad.py')
+        mod = load_module('sports_scanner', sports_path)
         if mod and hasattr(mod, 'run_scan'):
             mod.run_scan(post=True)
         else:
-            log.warning("[BRAD] brad.py has no run_scan() function")
+            log.warning("[BRAD] sports-scanner.py has no run_scan() function")
     except Exception as e:
         err = f"❌ **BRAD (Sports) FAILED**: {e}"
         log.error(err)
@@ -169,7 +160,7 @@ def run_sports_scanner():
 def run_weather_scanner():
     log.info('[WEATHER] Running weather scan...')
     try:
-        weather_path = os.path.join(AGENTS_DIR, 'weather.py')
+        weather_path = os.path.join(BOT_DIR, 'weather.py')
         mod = load_module('weather', weather_path)
         if mod and hasattr(mod, 'run_scan'):
             mod.run_scan(post=True)
@@ -183,12 +174,10 @@ def run_weather_scanner():
 def run_congress_scanner():
     log.info("[RUGRAT] Running congressional scan...")
     try:
-        rugrat_path = os.path.join(AGENTS_DIR, 'rugrat.py')
-        mod = load_module('rugrat', rugrat_path)
-        if mod and hasattr(mod, 'run_recent'):
-            mod.run_recent(post=False)  # SILENT MODE
-        else:
-            log.warning("[RUGRAT] rugrat.py has no run_recent() function")
+        sys.path.insert(0, BOT_DIR)
+        import rugrat
+        importlib.reload(rugrat)
+        rugrat.run_recent(post=False)  # SILENT MODE
     except Exception as e:
         err = f"❌ **RUGRAT (Congress) FAILED**: {e}"
         log.error(err)
@@ -198,12 +187,10 @@ def run_congress_scanner():
 def run_whale_scanner():
     log.info("[CHESTER] Running crypto whale scan...")
     try:
-        chester_path = os.path.join(AGENTS_DIR, 'chester.py')
-        mod = load_module('chester', chester_path)
-        if mod and hasattr(mod, 'run_scan'):
-            mod.run_scan(post=False)  # SILENT MODE
-        else:
-            log.warning("[CHESTER] chester.py has no run_scan() function")
+        sys.path.insert(0, BOT_DIR)
+        import chester
+        importlib.reload(chester)
+        chester.run_scan(post=False)  # SILENT MODE
     except Exception as e:
         err = f"❌ **CHESTER (Whale) FAILED**: {e}"
         log.error(err)
@@ -211,14 +198,23 @@ def run_whale_scanner():
 
 
 def run_options_check():
-    log.info("[JORDAN] Running options position check...")
+    global _last_full_check
+    log.info("[JORDAN] Running options price monitor...")
     try:
-        jordan_path = os.path.join(AGENTS_DIR, 'jordan.py')
-        mod = load_module('jordan', jordan_path)
-        if mod and hasattr(mod, 'run_position_check'):
-            mod.run_position_check(post=False)  # SILENT MODE
-        else:
-            log.warning("[JORDAN] jordan.py has no run_position_check() function")
+        sys.path.insert(0, BOT_DIR)
+        import jordan
+        importlib.reload(jordan)
+
+        # PRIMARY: price monitor every 15 min (market hours only)
+        jordan.run_price_monitor(post=True)
+
+        # SECONDARY: full position check every 60 min
+        now_ts = time.time()
+        if now_ts - _last_full_check >= 3600:
+            log.info("[JORDAN] Running full position check (60-min cadence)...")
+            jordan.run_position_check(post=True)
+            _last_full_check = now_ts
+
     except Exception as e:
         err = f"❌ **JORDAN (Options) FAILED**: {e}"
         log.error(err)
@@ -228,12 +224,10 @@ def run_options_check():
 def run_weekly_research():
     log.info("[MARK HANNA] Running weekly deep dive...")
     try:
-        mark_path = os.path.join(AGENTS_DIR, 'mark_hanna.py')
-        mod = load_module('mark_hanna', mark_path)
-        if mod and hasattr(mod, 'run_weekly'):
-            mod.run_weekly(post=False)  # SILENT MODE
-        else:
-            log.warning("[MARK HANNA] mark_hanna.py has no run_weekly() function")
+        sys.path.insert(0, BOT_DIR)
+        import mark_hanna
+        importlib.reload(mark_hanna)
+        mark_hanna.run_weekly(post=False)  # SILENT MODE
     except Exception as e:
         err = f"❌ **MARK HANNA (Research) FAILED**: {e}"
         log.error(err)
@@ -243,7 +237,7 @@ def run_weekly_research():
 def run_supervisor():
     log.info('[SUPERVISOR] Running heartbeat check...')
     try:
-        sup_path = os.path.join(TOOLS_DIR, 'supervisor.py')
+        sup_path = os.path.join(BOT_DIR, 'supervisor.py')
         mod = load_module('supervisor', sup_path)
         if mod and hasattr(mod, 'run_scan'):
             mod.run_scan()
@@ -257,23 +251,22 @@ def run_supervisor():
 
 # Per-scanner locks to prevent concurrent duplicate runs
 _scanner_locks = {}
-_locks_lock = threading.Lock()
 
 def get_scanner_lock(name: str):
-    with _locks_lock:
-        if name not in _scanner_locks:
-            _scanner_locks[name] = threading.Lock()
-        return _scanner_locks[name]
+    if name not in _scanner_locks:
+        import threading
+        _scanner_locks[name] = threading.Lock()
+    return _scanner_locks[name]
 
 # Map scanner names to functions
 SCANNERS = {
-    'kalshi':     run_kalshi_scanner,
-    'sports':     run_sports_scanner,
-    'congress':   run_congress_scanner,
-    'whale':      run_whale_scanner,
-    'options':    run_options_check,
-    'research':   run_weekly_research,
-    'weather':    run_weather_scanner,
+    'kalshi':   run_kalshi_scanner,
+    'sports':   run_sports_scanner,
+    'congress': run_congress_scanner,
+    'whale':    run_whale_scanner,
+    'options':  run_options_check,
+    'research': run_weekly_research,
+    'weather':  run_weather_scanner,
     'supervisor': run_supervisor,
 }
 
@@ -285,14 +278,13 @@ def get_status() -> str:
         "**🏦 THE FIRM — STATUS REPORT**",
         f"*{now.strftime('%Y-%m-%d %H:%M UTC')}*",
         "",
-        "**Agents:**",
-        "  🎰 Donnie — Kalshi prediction market execution",
-        "  🌤️ Weather — Daily high temperature markets",
-        "  🏈 Brad — Sports stink-bid strategy",
+        "**Bots:**",
+        "  🎰 Donnie — Kalshi/Polymarket scanner",
         "  🏛️ Rugrat — Congressional & insider tracker",
         "  🐋 Chester — Crypto whale tracker",
-        "  📈 Jordan — Options position monitor",
-        "  🎩 Mark Hanna — Macro research & deep dives",
+        "  📈 Jordan — Options coach & position monitor",
+        "  🏈 Brad — Sports betting & promo tracker",
+        "  🎩 Mark Hanna — Unconventional alpha research",
         "",
         "**Scanner Status:**",
     ]
@@ -309,14 +301,14 @@ def get_status() -> str:
 
     lines.extend([
         "",
-        "**Commands:**",
-        "  `/scan kalshi` `/scan sports` `/scan congress` `/scan weather`",
-        "  `/scan whale` `/scan options` `/scan research` `/status`",
+        "**Slash Commands:**",
+        "  `/scan kalshi` `/scan sports` `/scan congress`",
+        "  `/scan whale` `/promos` `/research weekly` `/status`",
     ])
     return "\n".join(lines)
 
 
-# ── Command handler ───────────────────────────────────────────────────────────
+# ── Simple HTTP command server (for slash command integration) ───────────────
 def handle_command(command: str, args: list = None) -> str:
     """Handle slash commands — called from Discord bot or direct invocation."""
     args = args or []
@@ -332,6 +324,10 @@ def handle_command(command: str, args: list = None) -> str:
             return f"✅ Kicked off **{target}** scan."
         return f"❌ Unknown scan target: {target}. Options: {', '.join(SCANNERS.keys())}"
 
+    elif command == 'promos':
+        run_sports_scanner()
+        return "✅ Brad is scanning promos..."
+
     elif command == 'research' and args and args[0].lower() == 'weekly':
         threading.Thread(target=run_weekly_research, daemon=True).start()
         return "✅ Mark Hanna is deep-diving..."
@@ -340,10 +336,10 @@ def handle_command(command: str, args: list = None) -> str:
         if len(args) > 1:
             ticker = args[1].upper()
             try:
-                mark_path = os.path.join(AGENTS_DIR, 'mark_hanna.py')
-                mod = load_module('mark_hanna', mark_path)
-                if mod:
-                    return mod.run_challenge(ticker, post=True)
+                sys.path.insert(0, BOT_DIR)
+                import mark_hanna
+                importlib.reload(mark_hanna)
+                return mark_hanna.run_challenge(ticker, post=True)
             except Exception as e:
                 return f"❌ Mark Hanna error: {e}"
         return "❌ Usage: /research challenge TICKER"
@@ -355,7 +351,7 @@ def handle_command(command: str, args: list = None) -> str:
 def scheduler_loop():
     global _running
     log.info("[FIRM] Scheduler started.")
-    while _running and not _stop_event.is_set():
+    while _running:
         now = time.time()
         for name, interval_minutes in SCHEDULE.items():
             interval_seconds = interval_minutes * 60
@@ -375,10 +371,27 @@ def scheduler_loop():
         time.sleep(60)  # check every minute
 
 
-# ── Startup announcement ──────────────────────────────────────────────────────
+# ── Discord gateway (lightweight polling — no discord.py required) ───────────
+def discord_set_presence(token: str, status: str, activity: str):
+    """Set bot presence via Discord REST (limited without gateway)."""
+    # Note: True presence requires Gateway connection (discord.py)
+    # This is a lightweight placeholder that logs intent
+    log.info(f"[FIRM] Presence set → {activity} ({status})")
+
+
 def announce_startup():
     """Post startup message to #general."""
+    # Load Stratton token from openclaw.json
     stratton_tok = STRATTON_TOKEN
+    if not stratton_tok:
+        try:
+            oc_path = os.path.expanduser('~/.openclaw/openclaw.json')
+            with open(oc_path) as f:
+                oc = json.load(f)
+            stratton_tok = oc.get('channels', {}).get('discord', {}).get('token', '')
+        except Exception as e:
+            log.error(f"Could not load Stratton token: {e}")
+
     if not stratton_tok:
         log.error("[FIRM] No Stratton token — skipping startup announcement")
         return
@@ -386,16 +399,15 @@ def announce_startup():
     now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
     message = (
         f"🏦 **THE FIRM IS OPERATIONAL** — {now}\n\n"
-        f"All agents are live. Intelligence is flowing.\n\n"
+        f"All bots are live. Intelligence is flowing.\n\n"
         f"**The Roster:**\n"
-        f"🎰 **Donnie** — Kalshi scanner + execution engine. Every 2 hours.\n"
-        f"🌤️ **Weather** — Daily high temp markets, dual-source forecasts. Every 5 min.\n"
-        f"🏈 **Brad** — Sports stink-bid strategy. Every 30 min.\n"
-        f"🏛️ **Rugrat** — Congressional trades, Senate Stock Watcher. Every 4 hours.\n"
-        f"🐋 **Chester** — Crypto whale tracker, BTC mempool. Every 30 min.\n"
-        f"📈 **Jordan** — Options position monitor. Every hour.\n"
-        f"🎩 **Mark Hanna** — Weekly unconventional alpha deep-dives.\n\n"
-        f"**Commands:** `/status` | `/scan [kalshi|sports|congress|whale|weather|options]` | `/research weekly`\n\n"
+        f"🎰 **Donnie V2** — Kalshi scanner + arb + weather markets + regime detector. Every 2 hours.\n"
+        f"🏛️ **Rugrat** — Congressional trades, Senate Stock Watcher, SEC Form 4 filings. Every 4 hours.\n"
+        f"🐋 **Chester** — Crypto whale tracker. BTC mempool + Whale Alert RSS. Every 30 min.\n"
+        f"📈 **Jordan** — Options position monitor & Discord alert analyzer. Every hour.\n"
+        f"🏈 **Brad** — Sports betting lines, promo tracker. Every 2 hours.\n"
+        f"🎩 **Mark Hanna** — Weekly unconventional alpha deep-dives. Devil's advocate mode available.\n\n"
+        f"**Commands:** `/status` | `/scan [kalshi|sports|congress|whale]` | `/promos` | `/research weekly`\n\n"
         f"_We don't slow down. We don't look back. We find the money._\n"
         f"— Stratton"
     )
@@ -408,7 +420,6 @@ def shutdown(sig, frame):
     global _running
     log.info("[FIRM] Shutdown signal received. Stopping...")
     _running = False
-    _stop_event.set()
     sys.exit(0)
 
 
@@ -418,12 +429,12 @@ signal.signal(signal.SIGTERM, shutdown)
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(description='The Firm — Master Agent Coordinator')
+    parser = argparse.ArgumentParser(description='The Firm — Master Bot Coordinator')
     parser.add_argument('--no-announce', action='store_true', help='Skip startup Discord announcement')
-    parser.add_argument('--scan',        type=str,            help='Run a specific scanner immediately')
+    parser.add_argument('--scan',        type=str,            help='Run a specific scanner immediately: kalshi|sports|congress|whale|options|research')
     parser.add_argument('--status',      action='store_true', help='Print status and exit')
     parser.add_argument('--command',     type=str,            help='Run a slash command (e.g. "scan kalshi")')
-    parser.add_argument('--bot',         type=str,            help='Run a single agent standalone')
+    parser.add_argument('--bot',         type=str,            help='Run a single bot standalone: donnie|rugrat|chester|jordan|brad|mark')
     parser.add_argument('--once',        action='store_true', help='Run all bots once then exit (no loop)')
     args = parser.parse_args()
 
@@ -439,13 +450,12 @@ def main():
 
     if args.bot:
         bot_map = {
-            'donnie':  ('kalshi',   'Donnie — Kalshi scanner'),
-            'weather': ('weather',  'Weather — Temperature markets'),
-            'rugrat':  ('congress', 'Rugrat — Congressional tracker'),
-            'chester': ('whale',    'Chester — Crypto whale tracker'),
-            'jordan':  ('options',  'Jordan — Options coach'),
-            'brad':    ('sports',   'Brad — Sports & promo scanner'),
-            'mark':    ('research', 'Mark Hanna — Research'),
+            'donnie': ('kalshi', 'Donnie — Kalshi scanner'),
+            'rugrat': ('congress', 'Rugrat — Congressional tracker'),
+            'chester': ('whale', 'Chester — Crypto whale tracker'),
+            'jordan': ('options', 'Jordan — Options coach'),
+            'brad': ('sports', 'Brad — Sports & promo scanner'),
+            'mark': ('research', 'Mark Hanna — Research'),
         }
         key = args.bot.lower()
         if key in bot_map:
@@ -454,8 +464,11 @@ def main():
             fn = SCANNERS.get(scanner_key)
             if fn:
                 fn()
+            else:
+                print(f"Scanner '{scanner_key}' not implemented yet.")
         else:
-            print(f"Unknown bot: {args.bot}. Options: {', '.join(bot_map.keys())}")
+            print(f"Unknown bot: {args.bot}")
+            print(f"Options: {', '.join(bot_map.keys())}")
         return
 
     if args.scan:
@@ -468,7 +481,7 @@ def main():
 
     if args.once:
         log.info("[FIRM] --once mode: running all scanners once then exiting")
-        for name in ['kalshi', 'weather', 'sports', 'congress', 'whale', 'options']:
+        for name in ['kalshi', 'sports', 'congress', 'whale', 'options']:
             try:
                 log.info(f"[FIRM] Running {name}...")
                 SCANNERS[name]()
@@ -480,17 +493,16 @@ def main():
     # Full startup
     log.info("=" * 60)
     log.info("  THE FIRM — Starting up")
-    log.info(f"  BASE_DIR: {BASE_DIR}")
     log.info("=" * 60)
 
     # Verify tokens
     token_check = {
-        'DONNIE':      DONNIE_TOKEN,
-        'RUGRAT':      RUGRAT_TOKEN,
-        'CHESTER':     CHESTER_TOKEN,
-        'JORDAN':      JORDAN_TOKEN,
-        'BRAD':        BRAD_TOKEN,
-        'MARK_HANNA':  MARK_HANNA_TOKEN,
+        'DONNIE': DONNIE_TOKEN,
+        'RUGRAT': RUGRAT_TOKEN,
+        'CHESTER': CHESTER_TOKEN,
+        'JORDAN': JORDAN_TOKEN,
+        'BRAD': BRAD_TOKEN,
+        'MARK_HANNA': MARK_HANNA_TOKEN,
     }
     for name, tok in token_check.items():
         if tok:
@@ -502,14 +514,12 @@ def main():
     if not args.no_announce:
         announce_startup()
 
-    # Pre-stamp timestamps to prevent immediate double-fire
+    # Run initial scans — set timestamps FIRST to prevent scheduler double-fire
+    log.info("[FIRM] Running initial scans on startup...")
     now_ts = time.time()
     for name in list(SCHEDULE.keys()):
-        _last_run[name] = now_ts
-
-    # Run initial scans
-    log.info("[FIRM] Running initial scans on startup...")
-    for name in ['kalshi', 'weather']:
+        _last_run[name] = now_ts  # pre-stamp all to prevent immediate re-fire
+    for name in ['kalshi', 'sports', 'weather']:
         try:
             log.info(f"[FIRM] Initial scan: {name}")
             SCANNERS[name]()
