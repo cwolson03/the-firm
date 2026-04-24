@@ -10,13 +10,13 @@ A multi-agent Python system running 24/7 on a Raspberry Pi 5. One command (`pyth
 
 > **CPI Shelter trade — April 10, 2026**
 > Donnie modeled a 40% probability that CPI shelter would print above 4.24%. Kalshi's market implied only 15%. Edge: +25 points. Donnie entered YES on `KXSHELTERCPI-26APR10-T424.0`. BLS printed 424.069 bps. Market resolved YES.
-> **Account balance: $102 → $383 on a single trade.**
+> **+275% return on position in a single trade.**
 
 > **GDP Q1 2026 — Three concurrent NO positions**
-> With Atlanta Fed GDPNow tracking at 1.24% annualized, Donnie entered NO on `KXGDP-26APR30-T2.0`, `T2.5`, and `T3.0`. Thesis: tariff drag + net export deterioration make sub-2% near-certain. Positions open at time of writing ($68.79 deployed).
+> With Atlanta Fed GDPNow tracking at 1.24% annualized, Donnie entered NO on `KXGDP-26APR30-T2.0`, `T2.5`, and `T3.0`. Thesis: tariff drag + net export deterioration make sub-2% near-certain. Positions held at time of writing.
 
 > **Post-trade analysis — BTC loss (April 2026)**
-> A NO position entered 9 minutes before close with spot $49 from threshold. Model was right directionally; execution failed — insufficient time buffer. This directly triggered `CRYPTO_MIN_MINUTES_TO_CLOSE = 30` and `CRYPTO_MIN_BUFFER_PCT = 0.005` as mandatory gates. Bad calls get logged and patched.
+> A NO position entered 9 minutes before close with spot only 0.05% from threshold. Model was right directionally; execution failed — insufficient time buffer. This directly triggered `CRYPTO_MIN_MINUTES_TO_CLOSE = 30` and `CRYPTO_MIN_BUFFER_PCT = 0.005` as mandatory gates. Bad calls get logged and patched.
 
 ---
 
