@@ -136,7 +136,7 @@ SERIES_CITY_MAP = {
 }
 
 # Edge thresholds
-WEATHER_EDGE_THRESHOLD    = 0.15   # 15¢ minimum edge
+WEATHER_EDGE_THRESHOLD    = 0.28   # 28¢ minimum edge (backtest optimized: >25¢ = 75%+ hit rate)
 MIN_FORECAST_MARGIN_MULT  = 1.5    # forecast must be >= this * uncertainty from threshold to signal
 MAX_ACTIVE_WEATHER_ORDERS = 3      # max simultaneous LIVE positions
 MAX_PAPER_SIGNALS         = 10     # max paper signals per scan cycle (prevent spam)
@@ -338,6 +338,7 @@ def log_experiment_signal(market: dict, parsed: dict, model_prob: float,
         'threshold':     parsed.get('threshold'),
         'direction':     direction,
         'forecast_high': market.get('_forecast_high'),
+        'forecast_source': market.get('_forecast_source', 'unknown'),
         'kalshi_prob':   round(kalshi_mid, 4),
         'model_prob':    round(model_prob, 4),
         'edge':          round(abs(edge), 4),
@@ -1469,7 +1470,8 @@ def _range_label(parsed: dict) -> str:
 
 def format_paper_msg(ticker: str, parsed: dict, direction: str, edge: float,
                       model_prob: float, kalshi_mid: float, forecast_high: float,
-                      uncertainty: float, contracts: int, cost: float) -> str:
+                      uncertainty: float, contracts: int, cost: float,
+                      forecast_source: str = 'unknown') -> str:
     city      = parsed['city_name']
     rng       = _range_label(parsed)
     date      = parsed['date']
@@ -1478,7 +1480,7 @@ def format_paper_msg(ticker: str, parsed: dict, direction: str, edge: float,
     return "\n".join([
         "📋 PAPER WEATHER — %s" % ticker,
         "City: %s | Date: %s | Range: %s" % (city, date, rng),
-        "Tomorrow.io high: %.1f°F ±%.1f°F" % (forecast_high, uncertainty),
+        "Forecast [%s]: %.1f°F ±%.1f°F" % (forecast_source.replace('tomorrow_io','T.io').replace('open_meteo','OM'), forecast_high, uncertainty),
         "Model: %.0f%% | Kalshi: %d¢ | Edge: %+.0f%%" % (model_prob*100, int(kalshi_mid*100), edge*100),
         "Would BUY %s @ %d¢ | %d contracts | $%.2f" % (direction, price_c, contracts, cost),
     ])
@@ -1878,6 +1880,16 @@ def run_weather_scan(dry_run: bool = False) -> dict:
             continue
 
         market["_forecast_high"] = forecast_high
+        # Track which model(s) provided the forecast for post-analysis
+        _sources_used = []
+        try:
+            _t = _fetch_tomorrow_io_daily(series, SERIES_CITY_MAP.get(series, {}))
+            if _t and date in _t: _sources_used.append('tomorrow_io')
+        except Exception: pass
+        if len(_sources_used) == 0 or fc_raw:
+            # If tomorrow.io missed or raw differs, open-meteo was primary/fallback
+            _sources_used.append('open_meteo')
+        market["_forecast_source"] = ','.join(_sources_used) if _sources_used else 'unknown' 
 
         st = parsed['strike_type']
         if st == 'between':
@@ -2011,6 +2023,11 @@ def run_weather_scan(dry_run: bool = False) -> dict:
         ticker    = market.get("ticker", "?")
         city_name = parsed['city_name']
 
+        # Only execute NO signals - YES bets have <5% hit rate (backtest confirmed)
+        if direction == 'YES':
+            log.debug('[Scan] %s: YES disabled - NO-only mode', ticker)
+            continue
+
         if dry_run:
             if paper_signals_this_scan >= MAX_PAPER_SIGNALS:
                 log.info("[PAPER] Hit MAX_PAPER_SIGNALS (%d) — skipping remaining candidates",
@@ -2032,7 +2049,8 @@ def run_weather_scan(dry_run: bool = False) -> dict:
 
             msg = format_paper_msg(
                 ticker, parsed, direction, edge, model_prob, kalshi_mid,
-                forecast_high, uncertainty, contracts, cost)
+                forecast_high, uncertainty, contracts, cost,
+                    forecast_source=market.get('_forecast_source', 'unknown'))
             # Paper trades: log only — no Discord post (signals channel = live trades only)
             log.info("[PAPER] %s", msg[:120])
             summary["trades"] += 1
@@ -2093,7 +2111,17 @@ def run_weather_scan(dry_run: bool = False) -> dict:
 
 def run_scan(post=None, **kwargs):
     """Entry point for firm.py orchestrator. PAPER MODE until Cody approves live."""
-    run_weather_scan(dry_run=True)
+    result = run_weather_scan(dry_run=True)
+    try:
+        import sys as _sys
+        _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from shared_context import write_agent_status
+        trades = result.get("trades", 0) if isinstance(result, dict) else 0
+        edges = len(result.get("edges", [])) if isinstance(result, dict) else 0
+        write_agent_status("weather", {"status": "ran", "trades": trades, "signals_found": edges})
+    except Exception:
+        pass
+    return result
 
 
 def main():

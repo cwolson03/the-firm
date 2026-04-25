@@ -38,6 +38,16 @@ export interface ActivityEntry {
   raw: string;
 }
 
+export interface PositionItem {
+  ticker: string;
+  title: string;
+  side: string;
+  contracts: number;
+  avg_price_cents: number;
+  exposure: number;
+  realized_pnl: number;
+}
+
 export interface WeatherResponse {
   total: number;
   resolved: number;
@@ -45,7 +55,8 @@ export interface WeatherResponse {
   win_rate: number;
   by_city: Record<string, { total: number; wins: number; win_rate: number; edge_avg: number | null }>;
   by_source: Record<string, { total: number; wins: number; win_rate: number }>;
-  recent: unknown[];
+  recent: any[];
+  open: any[];
 }
 
 export interface BradResponse {
@@ -54,7 +65,8 @@ export interface BradResponse {
   wins: number;
   win_rate: number;
   by_strategy: Record<string, { total: number; wins: number; win_rate: number }>;
-  recent: unknown[];
+  recent: any[];
+  open: any[];
 }
 
 export interface RagDemoResponse {
@@ -95,13 +107,28 @@ export interface EvalRecord {
   };
 }
 
+export interface FileInfo {
+  name: string;
+  lines: number;
+  size_kb: number;
+  modified: string;
+}
+
+export interface FileContent {
+  path: string;
+  content: string;
+  lines: number;
+  size_kb: number;
+  modified: string;
+}
+
 // API calls
 
 export const fetchHealth = () => get<{ status: string; timestamp: string }>("/health");
 export const fetchStatus = () => get<StatusResponse>("/api/status");
 export const fetchActivity = (n = 100, agent = "") =>
   get<ActivityEntry[]>(`/api/activity?n=${n}${agent ? `&agent=${agent}` : ""}`);
-export const fetchPositions = () => get<unknown[]>("/api/positions");
+export const fetchPositions = () => get<PositionItem[]>("/api/positions");
 export const fetchWeather = () => get<WeatherResponse>("/api/weather");
 export const fetchBrad = () => get<BradResponse>("/api/brad");
 export const fetchEval = () => get<EvalRecord[]>("/api/eval");
@@ -110,3 +137,7 @@ export const fetchRagDemo = (member: string, ticker: string, trade_type: string)
     `/api/rag-demo?member=${encodeURIComponent(member)}&ticker=${encodeURIComponent(ticker)}&trade_type=${encodeURIComponent(trade_type)}`
   );
 export const fetchPortfolio = () => get<PortfolioItem[]>("/api/portfolio");
+export const fetchKalshiBalance = () => get<{ balance: number }>("/api/kalshi/balance");
+export const fetchKalshiHistory = () => get<any[]>("/api/kalshi/history");
+export const fetchFiles = () => get<FileInfo[]>("/api/files");
+export const fetchFile = (path: string) => get<FileContent>(`/api/file?path=${encodeURIComponent(path)}`);

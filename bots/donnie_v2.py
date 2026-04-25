@@ -2687,9 +2687,67 @@ def run_execution_check(plays: list, dry_run: bool = False):
             ok, reason = should_execute(signal, balance, positions, total_exp)
 
             if ok:
+                # ── Gate 6 — LLM reasoning check (ECONOMIC_DATA tier, edge > 20%) ──────
+                _market_class_g6 = signal.get('market_class', '')
+                _econ_edge_g6    = abs(signal.get('econ_edge', 0.0))
+                if _market_class_g6 == 'ECONOMIC_DATA' and _econ_edge_g6 > 0.20:
+                    try:
+                        import sys as _sys_g6
+                        if '/home/cody/stratton/bots' not in _sys_g6.path:
+                            _sys_g6.path.insert(0, '/home/cody/stratton/bots')
+                        from llm_client import llm_reason, trade_review_prompt
+                        _g6_ticker  = signal.get('ticker', '')
+                        _g6_dir     = signal.get('direction', 'YES')
+                        _g6_mid_c   = signal.get('mid_c', 50)
+                        _g6_src     = signal.get('econ_source', 'quant model')
+                        _g6_prompt  = trade_review_prompt(
+                            market        = _g6_ticker,
+                            direction     = "YES" if _g6_dir.upper() == "YES" else "NO",
+                            edge_pct      = _econ_edge_g6 * 100,
+                            data_summary  = (
+                                f"Model edge: {_econ_edge_g6:.2f} | "
+                                f"Market mid: {_g6_mid_c}c | "
+                                f"Source: {_g6_src}"
+                            ),
+                            macro_context = "Tariff environment, Iran energy shock, Fed on hold",
+                        )
+                        _g6_result = llm_reason(_g6_prompt, primary="grok", shadow=None)
+                        if not _g6_result.get("go", True):  # default True if LLM fails
+                            _g6_reason = _g6_result.get('reasoning', 'no reason')[:100]
+                            log.info(f"[DONNIE] LLM gate BLOCKED {_g6_ticker}: {_g6_reason}")
+                            post_discord(
+                                "\U0001f9e0 LLM BLOCK: " + _g6_ticker + " | " + _g6_result.get('reasoning', '')[:200],
+                                channel_id=DISCORD_CH_RESULTS,
+                                dry_run=dry_run,
+                            )
+                            continue  # skip this candidate — LLM said no
+                        _g6_conf = _g6_result.get('confidence', 'unknown')
+                        _g6_rsn  = _g6_result.get('reasoning', '')[:80]
+                        log.info(f"[DONNIE] LLM gate PASSED {_g6_ticker}: confidence={_g6_conf} | {_g6_rsn}")
+                    except Exception as _g6_err:
+                        log.warning(f"[DONNIE] LLM gate error (trade proceeds): {_g6_err}")
+                        # LLM failure = never block the trade (graceful degradation)
+
                 log.info(f"[EXEC] ✅ Executing {signal['ticker']}{' (DRY RUN)' if dry_run else ''}")
                 result = execute_trade(signal, dry_run=dry_run)
                 post_execution_result(signal, result, dry_run=dry_run)
+                # ── Eval Framework: log trade at entry ────────────────────────
+                if result.get('status') not in ('failed', 'skipped'):
+                    try:
+                        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+                        from eval_framework import log_trade_entry as _ef_log
+                        _ef_log(
+                            trade_id=signal.get('ticker', 'unknown'),
+                            agent='donnie',
+                            market=signal.get('ticker', 'unknown'),
+                            direction=signal.get('direction', 'YES'),
+                            entry_edge_pct=abs(signal.get('edge_dollars', 0)) * 100,
+                            llm_confidence=str(signal.get('confidence', '')),
+                            raw_thesis=f"mid={signal.get('mid_c', 0)}c model_prob={signal.get('model_prob', 0):.3f}",
+                            raw_llm_reason=signal.get('llm_reason', '')[:500] if signal.get('llm_reason') else '',
+                        )
+                    except Exception:
+                        pass  # eval logging never blocks execution
             else:
                 log.info(f"[EXEC] Skipping {signal['ticker']}: {reason}")
 
@@ -2968,6 +3026,23 @@ def run_realtime_monitor(dry_run: bool = False):
                     log.info(f"[Tier2] ✅ Executing triggered market {ticker}")
                     result = execute_trade(play, dry_run=dry_run)
                     post_execution_result(play, result, dry_run=dry_run)
+                    # ── Eval Framework: log trade at entry ────────────────────
+                    if result.get('status') not in ('failed', 'skipped'):
+                        try:
+                            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+                            from eval_framework import log_trade_entry as _ef_log2
+                            _ef_log2(
+                                trade_id=play.get('ticker', 'unknown'),
+                                agent='donnie',
+                                market=play.get('ticker', 'unknown'),
+                                direction=play.get('direction', 'YES'),
+                                entry_edge_pct=abs(play.get('edge_dollars', 0)) * 100,
+                                llm_confidence=str(play.get('confidence', '')),
+                                raw_thesis=f"Tier2 trigger: mid={play.get('mid_c', 0)}c",
+                                raw_llm_reason='',
+                            )
+                        except Exception:
+                            pass  # eval logging never blocks execution
                 else:
                     log.info(f"[Tier2] Guardrail blocked {ticker}: {reason}")
             except Exception as e:
@@ -3901,6 +3976,13 @@ def main():
 def run_scan(post=None, **kwargs):
     """Entry point for firm.py orchestrator. Runs a single discovery scan."""
     run_discovery_scan(dry_run=False)
+    try:
+        import sys as _sys, os as _os
+        _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+        from shared_context import write_agent_status
+        write_agent_status('donnie', {'status': 'ran', 'markets_scanned': 0})
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
