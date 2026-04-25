@@ -1,6 +1,6 @@
 # The Firm — Autonomous Trading Intelligence System
 
-A multi-agent Python system running 24/7 on a Raspberry Pi 5. One command (`python3 firm.py`) launches every agent. Agents scan live markets, identify statistical mispricings, execute trades autonomously within hard risk guardrails, and monitor positions around the clock.
+A multi-agent Python system running 24/7 on a Raspberry Pi 5. One command (`python3 firm.py`) launches every agent. Agents scan live markets, identify statistical mispricings using quantitative models and LLM reasoning, execute trades autonomously within hard risk guardrails, and monitor positions around the clock.
 
 **Live since April 2026. Real capital deployed on [Kalshi](https://kalshi.com).**
 
@@ -16,7 +16,7 @@ A multi-agent Python system running 24/7 on a Raspberry Pi 5. One command (`pyth
 > With Atlanta Fed GDPNow tracking at 1.24% annualized, Donnie entered NO on `KXGDP-26APR30-T2.0`, `T2.5`, and `T3.0`. Thesis: tariff drag + net export deterioration make sub-2% near-certain. Positions held at time of writing.
 
 > **Post-trade analysis — BTC loss (April 2026)**
-> A NO position entered 9 minutes before close with spot only 0.05% from threshold. Model was right directionally; execution failed — insufficient time buffer. This directly triggered `CRYPTO_MIN_MINUTES_TO_CLOSE = 30` and `CRYPTO_MIN_BUFFER_PCT = 0.005` as mandatory gates. Bad calls get logged and patched.
+> A NO position entered 9 minutes before close with spot only 0.05% from threshold. Model was right directionally; execution failed — insufficient time buffer. This triggered `CRYPTO_MIN_MINUTES_TO_CLOSE = 30` and `CRYPTO_MIN_BUFFER_PCT = 0.005` as mandatory gates. Bad calls get logged and patched.
 
 ---
 
@@ -36,35 +36,33 @@ A multi-agent Python system running 24/7 on a Raspberry Pi 5. One command (`pyth
           ┌──────────┬─────────────┼──────────────┬──────────────┐
           │          │             │              │              │
     ┌─────▼──┐  ┌────▼───┐  ┌─────▼──┐  ┌───────▼──┐  ┌────────▼──┐
-    │ Donnie │  │Weather │  │  Brad  │  │  Rugrat  │  │  Jordan   │
-    │ v2.py  │  │ .py    │  │  .py   │  │  .py     │  │  .py      │
-    │        │  │        │  │        │  │          │  │           │
-    │Kalshi  │  │Temp    │  │Sports  │  │Congress  │  │Options &  │
-    │Exec    │  │Markets │  │Stink   │  │Trade     │  │Portfolio  │
-    │Engine  │  │19 cities│ │Bids    │  │Monitor   │  │Desk       │
+    │Kalshi  │  │Weather │  │Sports  │  │Congress  │  │ Options   │
+    │Exec    │  │Markets │  │Betting │  │Intel     │  │  Desk     │
+    │Engine  │  │Scanner │  │Engine  │  │+ RAG     │  │ (Jordan)  │
     └────────┘  └────────┘  └────────┘  └──────────┘  └───────────┘
           │          │             │              │              │
           └──────────┴─────────────┴──────────────┴──────────────┘
                                    │
-                    ┌──────────────▼──────────────┐
-                    │       shared_state.json      │
-                    │    Live context layer —      │
-                    │  each agent writes status,   │
-                    │  positions, signals on run   │
-                    └──────────────┬──────────────┘
+               ┌───────────────────▼───────────────────┐
+               │           Intelligence Layer           │
+               │                                        │
+               │  LLM Reasoning    RAG Pipeline         │
+               │  Grok + Claude    ChromaDB             │
+               │  + GPT-4o         206 disclosures      │
+               │  (llm_client.py)  (rag_store.py)       │
+               └───────────────────┬───────────────────┘
                                    │
-                    ┌──────────────▼──────────────┐
-                    │          Discord             │
-                    │   One bot token per agent    │
-                    │   Channel-routed alerts      │
-                    │   REST only, no gateway      │
-                    └─────────────────────────────┘
-
-Additional:
-  supervisor.py  — 6-check health monitor (30 min)
-  mark_hanna.py  — Weather intelligence + on-demand research
-  chester.py     — Crypto whale tracker (in development)
-  backtest.py    — Strategy validation against historical data
+               ┌───────────────────▼───────────────────┐
+               │           shared_state.json            │
+               │    Every agent writes status here      │
+               │    Dashboard API reads from here       │
+               └───────────────────┬───────────────────┘
+                                   │
+               ┌───────────────────▼───────────────────┐
+               │        Dashboard (Next.js + FastAPI)   │
+               │   7 tabs: Economics | Weather | Sports │
+               │   Intelligence | Portfolio | System    │
+               └───────────────────────────────────────┘
 ```
 
 ---
@@ -75,31 +73,23 @@ Every agent runs through `firm.py`. One process. One command.
 
 ```bash
 python3 firm.py                   # Full startup — all agents, Discord announcement
-python3 firm.py --bot donnie      # Run one agent standalone
+python3 firm.py --bot donnie      # Run Kalshi execution engine standalone
 python3 firm.py --bot rugrat      # Run congressional scanner standalone
-python3 firm.py --scan weather    # Trigger a specific scanner immediately
+python3 firm.py --scan weather    # Trigger weather scanner immediately
 python3 firm.py --once            # Run all scheduled agents once then exit
 python3 firm.py --dry-run         # Full simulation — no Discord posts, no orders
 python3 firm.py --status          # Print live scheduler status and exit
 ```
 
-**Scheduler design:**
-- Each agent runs in its own `threading.Thread` daemon
-- `threading.Lock` per scanner prevents concurrent duplicate runs
-- `_stop_event` (`threading.Event`) enables clean SIGTERM/SIGINT shutdown
-- `RotatingFileHandler` (5MB, 3 backups) at `logs/firm.log`
-- 429 rate-limit retry on all Discord posts (3 attempts, exponential backoff)
-- Agents loaded via `importlib.util.spec_from_file_location` — no shared module state
-
 **Live schedule:**
-| Agent | Interval |
-|-------|---------|
-| Weather | 3 min |
-| Brad | 15 min |
-| Jordan (price monitor) | 15 min |
-| Supervisor | 30 min |
-| Donnie v2 | 120 min |
-| Rugrat | 240 min |
+| Agent | Purpose | Interval |
+|-------|---------|---------|
+| Weather (weather.py) | Temperature market scanner | 3 min |
+| Sports (brad.py) | Sports stink-bid strategy | 15 min |
+| Options (jordan.py) | SPY 0DTE price monitor | 15 min |
+| Supervisor (supervisor.py) | System health monitor | 30 min |
+| Kalshi (donnie_v2.py) | Prediction market execution | 120 min |
+| Congressional (rugrat.py) | Congressional trade tracker | 240 min |
 
 ---
 
@@ -109,223 +99,196 @@ python3 firm.py --status          # Print live scheduler status and exit
 the-firm/
 ├── firm.py                  # Master orchestrator — run this
 ├── bots/
-│   ├── donnie_v2.py         # Kalshi execution engine
-│   ├── weather.py           # Temperature market scanner
-│   ├── brad.py              # Sports stink-bid strategy
-│   ├── rugrat.py            # Congressional trade monitor
-│   ├── jordan.py            # Options & portfolio desk
-│   ├── mark_hanna.py        # Weather intelligence + research
-│   ├── chester.py           # Crypto whale tracker
-│   ├── supervisor.py        # System health monitor
+│   ├── donnie_v2.py         # Kalshi prediction market execution engine
+│   ├── weather.py           # Temperature market scanner (19 cities)
+│   ├── brad.py              # Sports stink-bid strategy (S1/S2/S3)
+│   ├── rugrat.py            # Congressional trade monitor + RAG pipeline
+│   ├── jordan.py            # SPY 0DTE options desk
+│   ├── mark_hanna.py        # Macro research analyst (on-demand)
+│   ├── chester.py           # Crypto whale tracker (in development)
+│   ├── supervisor.py        # System health monitor (6 checks)
+│   ├── llm_client.py        # Multi-model LLM: Grok + Claude + GPT-4o
+│   ├── rag_store.py         # ChromaDB vector store (206 disclosures)
+│   ├── rag_ingest.py        # RAG bootstrap + incremental update
+│   ├── eval_framework.py    # Trade evaluation + LLM process scoring
 │   └── shared_context.py    # Shared state writer (all agents)
+├── dashboard/
+│   ├── api/main.py          # FastAPI backend (8 endpoints)
+│   └── web/                 # Next.js frontend (7 tabs)
 ├── tools/
 │   ├── backtest.py          # Strategy backtester
 │   └── strategy_review.py   # Weather experiment analyzer
-├── config/
-│   ├── bot-tokens.env       # Discord bot tokens (gitignored)
-│   ├── keys.env             # API keys (gitignored)
-│   └── jordan_positions.json # Open positions (gitignored)
 ├── data/
-│   ├── shared_state.json    # Live context layer
-│   ├── brad_paper_trades.json
-│   └── rugrat_seen.json
+│   └── shared_state.json    # Live context layer (all agents write here)
 └── logs/
     └── firm.log             # Rotating log (5MB, 3 backups)
 ```
 
 ---
 
-## Donnie v2 — Core Execution Engine
+## Intelligence Layer
 
-**5-gate execution model.** Every candidate must clear all five gates before an order is placed:
+### LLM Reasoning (llm_client.py)
+
+Every significant decision gets an independent LLM review before execution or alert.
+
+| Model | Role | Used By |
+|-------|------|---------|
+| **Grok (xAI)** | Real-time signals, live news, sports intelligence | Donnie Gate 6, Brad S1, Rugrat alerts, Jordan exits |
+| **Claude Haiku** | Deep analysis, structured reasoning, eval critique | Eval framework, Rugrat brief |
+| **GPT-4o Mini** | Shadow check on high-conviction trades | Available for consensus checks |
+
+**Multi-model consensus:** When models disagree on go/no-go, confidence is downgraded. LLM failure never blocks execution — graceful degradation hardwired throughout.
+
+---
+
+## Kalshi Execution Engine (donnie_v2.py)
+
+**5 + 1 gate model.** Every trade candidate must clear all six gates:
 
 1. **Price edge** — minimum 18¢ directional edge above Kalshi's fee structure
-2. **Order book pressure** — bid/ask imbalance (`yes_bid_size_fp` vs `yes_ask_size_fp`)
-3. **Market velocity** — price acceleration tracking; SPIKE (>10¢/min) → immediate re-score
-4. **Whale accumulation** — large trade clustering in last hour (≥50 contracts, ≥$200 notional)
-5. **Time-to-close penalty** — exponential confidence decay past 14 days; hard block past 90 days
+2. **Order book pressure** — bid/ask imbalance analysis
+3. **Market velocity** — price acceleration tracking; SPIKE >10¢/min triggers re-score
+4. **Whale accumulation** — large trade clustering (≥50 contracts, ≥$200 notional)
+5. **Time-to-close penalty** — exponential confidence decay past 14 days
+6. **LLM Gate** — Grok reviews ECONOMIC_DATA trades with >20pt edge before execution
 
 **Data models:**
-- **GDPNow** (Atlanta Fed via FRED) → GDP threshold markets (`KXGDP-*`)
-- **Cleveland Fed CPI nowcast** → CPI/PCE markets (`KXCPI-*`, `KXPCE-*`)
-- **CoinGecko** → BTC/ETH intraday range markets (`KXBTCD-*`, `KXETHD-*`)
+- **GDPNow** (Atlanta Fed via FRED) → GDP threshold markets
+- **Cleveland Fed CPI nowcast** → CPI/PCE markets
+- **CoinGecko** → BTC/ETH intraday ranges
 - **Stooq** → Gold, crude, commodity markets
 
-**Market classification tiers:**
+**Market tiers:**
 
 | Class | Score Multiplier | Examples |
 |-------|-----------------|---------|
 | `ECONOMIC_DATA` | 3.0× | CPI, NFP, FOMC, GDP, PCE |
-| `WEATHER` | 2.5× | Temperature markets (delegated to weather.py) |
-| `COMMODITY` | 2.5× | Gold, oil, silver daily ranges |
-| `CRYPTO_SHORT` | 2.0× | BTC/ETH intraday ranges |
-| `POLITICAL_NEWS` | 1.0× | Breaking news — whale signal required |
+| `WEATHER` | 2.5× | Temperature markets |
+| `COMMODITY` | 2.5× | Gold, oil, silver |
+| `CRYPTO_SHORT` | 2.0× | BTC/ETH intraday |
 | `JUNK` | 0.0× | Excluded entirely |
-
-**Position sizing:** Confidence-scaled from 4% (≥0.65) to 12% (≥0.85, near-expiry). Hard cap: 35% per position, 70% total deployed.
-
-**Post-trade guardrails added from live losses:**
-- Crypto/commodity: min 30 min to close + 0.5% spot buffer from threshold
-- Momentum conflict check: blocks NO bets when 24h drift contradicts direction
-- Stale order cleanup: auto-cancels resting orders after 2 hours
 
 ---
 
-## Weather Bot
+## Congressional Intelligence + RAG (rugrat.py + rag_store.py)
+
+Tracks STOCK Act disclosures from 18 members of Congress. When a high-scoring member makes a significant trade, Rugrat retrieves historical context via RAG and generates an LLM brief.
+
+**RAG Pipeline:**
+1. New disclosure detected
+2. Multi-query embedding search across 206 stored disclosures
+3. Retrieve top 5 semantically relevant prior trades + member profile
+4. Feed context to Grok → structured trade brief
+5. Post to Discord with confidence + risks
+
+**Scoring model (0–100):** Track record (30) + Trade size (20) + Committee relevance (20) + Portfolio overlap (15) + Macro alignment (15)
+
+**Top tracked members:** Nancy Pelosi (28/30), Michael McCaul (26), Ro Khanna (25), Josh Gottheimer (24), Dan Crenshaw (22)
+
+**The pitch:** Replace STOCK Act disclosures with any institutional knowledge base — ATS contacts, deal histories, relationship graphs — and it's the same architecture.
+
+---
+
+## Weather Scanner (weather.py)
 
 Scans Kalshi's `KXHIGH*` series (19 cities) for daily high temperature mispricings.
 
-**Three-source forecasting:**
-- **Primary:** Tomorrow.io (UTC midnight-anchored to prevent truncation artifacts)
-- **Fallback:** Open-Meteo (free, no auth, 6-day GFS forecast)
-- **Tertiary:** NOAA gridpoint API
-
-**Multi-model consensus:** `forecast_high` = mean of available models. `uncertainty` = std dev (capped 1.5°F–6°F). `agreement` ∈ HIGH/MEDIUM/LOW — LOW forecasts skipped entirely.
-
-**Edge calculation:** Normal CDF against strike type (`less`, `greater`, `between`). Threshold markets require forecast at least `1.5 × uncertainty` from strike before signal fires.
-
-**Bias calibration:** Rolling 7-day per-city correction from resolved trades. Activates after ≥3 settled samples.
-
-**Prefetch engine:** Forecasts cached at model update windows (00:30, 06:30, 12:30, 18:30 UTC).
+**Three-source forecasting:** Tomorrow.io (primary) → Open-Meteo (fallback) → NOAA gridpoint
+**990 paper trades since April 2026 — 35.6% win rate**
+**Source tagged per trade** for calibration: `forecast_source` field tracks Tomorrow.io vs Open-Meteo
 
 ---
 
-## Brad — Sports Stink-Bid Strategy
+## Sports Engine (brad.py)
 
-Places limit buy orders at a discount to market mid, waiting for volatility to fill the bid. Three parallel strategies:
+Stink-bid strategy across Kalshi sports markets. Three parallel strategies:
 
-| Strategy | Discount | Min Favorite | Max Bids | Capital Cap |
-|----------|---------|-------------|---------|------------|
-| S1 — Live game winners | 20–25% | 55¢ | 5 | 12% |
-| S2 — Spread/prop markets | 20% | 60¢ | 3 | 8% |
-| S3 — Tournament outrights | 35% | 70¢ | 2 | 5% |
+| Strategy | Discount | Capital Cap |
+|----------|---------|------------|
+| S1 — Live game winners | 20–25% | 12% |
+| S2 — Spread/props | 20% | 8% |
+| S3 — Tournament outrights | 35% | 5% |
 
-**Intelligence layers:**
-- **The Odds API** — sportsbook probability cross-check on S1 markets (DraftKings/FanDuel vig-normalized)
-- **Grok xAI** — real-time injury alerts and sharp money signals for S1 games within 6 hours of tip-off
-- **ESPN live scoreboards** — blowout detection; cancels bids if favorite losing badly in late periods
-
-Paper mode by default. Trades logged to `data/brad_paper_trades.json`.
+**Intelligence:** The Odds API (sportsbook cross-check) + Grok xAI (injury/sharp signals within 6hr of tip-off)
 
 ---
 
-## Rugrat — Congressional Trade Intelligence
+## Options Desk (jordan.py)
 
-Monitors STOCK Act disclosures from 18 tracked members of Congress. Alerts when high-scoring members make significant moves.
+SPY 0DTE monitoring. Tracks options positions with price targets, polls live prices every 15 minutes during market hours, fires alerts when targets are hit or approached.
 
-**Scoring model (0–100 scale):**
-- Track record (0–30): documented historical returns
-- Transaction size (0–20): larger = more signal
-- Committee relevance (0–20): Armed Services buys defense, Intelligence buys crypto, etc.
-- Portfolio overlap (0–15): cross-referenced against Cody's open book
-- Macro alignment (0–15): does the trade fit the current macro regime
-
-**Top tracked members:** Nancy Pelosi (28), Michael McCaul (26), Ro Khanna (25), Josh Gottheimer (24), Dan Crenshaw (22), Mark Kelly (22)
-
-**Data sources:** Senate Stock Watcher + House Stock Watcher public S3 APIs. New disclosures deduplicated against `data/rugrat_seen.json`.
-
-**Alert tiers:** HIGH_CONVICTION → `#senator-tracker` + `#active-plays`. WATCH → `#senator-tracker`. Low-signal → batched daily summary.
+**Time-based alerts:** Morning brief (9:30 ET) → 2PM warning → 3PM final hour → 3:45PM last chance → EOD sweep (4:15PM)
 
 ---
 
-## Jordan — Options & Portfolio Desk
+## Eval Framework (eval_framework.py)
 
-Tracks options positions and personal portfolio. Replaces blind Discord group alerts with a systematic monitoring framework.
+After every trade resolves, an LLM critiques the decision quality — not just the outcome.
 
-**For Discord group alerts:**
-- Analyzes the alert independently (upside %, 52W context, risk/reward)
-- Tracks the position with a `target_price` field
-- Polls live prices every 15 minutes during market hours (9:30–16:00 ET)
-- Fires alert to `#active-plays` when price crosses the target or comes within 1%
-
-**For all positions:**
-- DTE alerts: 🔴 critical at ≤7 DTE, ⚠️ warning at ≤21 DTE
-- Roll calculator: three scenarios (roll out, roll + adjust strike, close)
-- Rough delta estimates (ATM/ITM/OTM bucketing)
-- Supports both `option` and `stock` position types
-
-```bash
-# Add an options position from a Discord group alert
-python3 bots/jordan.py --add NVDA CALL 950 2026-04-25 2 8.50 --target 965 --source discord_group
-
-# Analyze a ticker before entering
-python3 bots/jordan.py --analyze NVDA
-
-# Analyze a Discord alert directly
-python3 bots/jordan.py --alert NVDA 965
-
-# Run price target monitor
-python3 bots/jordan.py --monitor
+```json
+{
+  "process_score": 8,
+  "edge_quality": "strong",
+  "what_worked": "Cleveland Fed nowcast was predictive signal",
+  "what_to_improve": "Position sizing was conservative given confidence",
+  "lesson": "Add momentum confirmation for CPI components",
+  "avoid_next_time": "Don't enter crypto markets within 30 min of close"
+}
 ```
 
----
-
-## Supervisor — System Health Monitor
-
-Runs every 30 minutes. Six checks, posts to Discord `#general` on any anomaly (2-hour cooldown per alert type).
-
-| Check | What it does |
-|-------|-------------|
-| 1. Service health | `stratton-firm.service` is active |
-| 2. Log error rate | Error count in last 30 min from firm.log |
-| 3. Kalshi balance | Balance vs. established baseline |
-| 4. Resting orders | Unexpected live orders (Donnie stale cleanup) |
-| 5. Paper mode integrity | Verifies brad.py and weather.py paper flags |
-| 6. GDP stop-loss | T2.0 NO position price vs. 55¢ stop |
+Weekly health report synthesizes patterns across all resolved trades.
 
 ---
 
-## Backtesting
+## System Monitor (supervisor.py)
 
-`tools/backtest.py` validates strategies before live deployment.
+Runs every 30 minutes. Six checks, posts to Discord on anomaly (2-hour cooldown).
 
-**Weather backtest:**
-- Settled paper trades with real Kalshi prices at signal time
-- Kalshi finalized markets (last 30 days) cross-referenced with Open-Meteo GFS historical forecasts
-- Analysis: edge bucket breakdown, per-city win rates, model calibration, forecast bias, optimal threshold search
+| Check | Condition |
+|-------|-----------|
+| Service health | stratton-firm.service is active |
+| Log error rate | Errors in last 30 min |
+| Kalshi balance | Balance vs baseline |
+| Resting orders | No unexpected live orders |
+| Paper mode | brad.py and weather.py paper flags intact |
+| Stop-loss | GDP T2.0 position < 55¢ |
 
-**GDP analysis:**
-- 8 quarters FRED data (Q1 2024–Q4 2025)
-- GDPNow as live signal — flags when Atlanta Fed estimate diverges from Kalshi implied probability
+---
+
+## Dashboard
+
+FastAPI backend (8 endpoints) + Next.js frontend (7 tabs).
+
+```bash
+# Start API (runs as stratton-api.service on Atlas)
+cd dashboard/api && uvicorn main:app --host 0.0.0.0 --port 8000
+
+# Start frontend
+cd dashboard/web && npm run dev
+```
+
+**API endpoints:** `/api/status` `/api/activity` `/api/positions` `/api/weather` `/api/brad` `/api/eval` `/api/rag-demo` `/api/portfolio`
 
 ---
 
 ## Setup
 
 ```bash
-git clone https://github.com/your-username/the-firm.git
+git clone https://github.com/cwolson03/the-firm.git
 cd the-firm
 
 cp .env.example .env
-# Fill in: KALSHI_KEY_ID, KALSHI_PRIVATE_KEY_PATH, Discord bot tokens, FRED_API_KEY
+# Add: KALSHI_KEY_ID, KALSHI_PRIVATE_KEY_PATH, Discord bot tokens,
+# FRED_API_KEY, TOMORROW_API_KEY, GROK_API_KEY, CLAUDE_API_KEY, OPENAI_API_KEY
 
 pip install -r requirements.txt
 
 # Full startup
 python3 firm.py
 
-# Test without placing orders or posting to Discord
+# Test without orders or Discord posts
 python3 firm.py --dry-run --once
-```
-
-**Kalshi auth:** RSA-PSS signing. Generate key pair, upload public key to Kalshi account, set `KALSHI_KEY_ID` and `KALSHI_PRIVATE_KEY_PATH` in `.env`.
-
-**Required env vars:**
-```
-KALSHI_KEY_ID=
-KALSHI_PRIVATE_KEY_PATH=
-DONNIE_TOKEN=        # Discord bot tokens (one per agent)
-WEATHER_TOKEN=
-BRAD_TOKEN=
-RUGRAT_TOKEN=
-JORDAN_TOKEN=
-MARK_HANNA_TOKEN=
-CHESTER_TOKEN=
-STRATTON_TOKEN=
-FRED_API_KEY=
-TOMORROW_API_KEY=
-ODDS_API_KEY=
-GROK_API_KEY=
 ```
 
 ---
@@ -334,23 +297,26 @@ GROK_API_KEY=
 
 | Component | Purpose |
 |-----------|---------|
-| **Python 3.11+** | All agents — asyncio-free, threading only |
-| **Raspberry Pi 5** | Production host, `stratton-firm.service` via systemd |
-| **Kalshi API** | RSA-PSS auth, paginated events (~5,200 markets/scan) |
-| **Discord API** | REST only, one bot token per agent |
-| **FRED API** | GDPNow, CPI, PCE series |
-| **Tomorrow.io** | Temperature forecasts (500/day free tier) |
-| **Open-Meteo** | Free forecast fallback |
-| **NOAA Gridpoint API** | Tertiary weather source |
-| **CoinGecko** | BTC/ETH spot prices (free) |
-| **The Odds API** | Sportsbook probabilities for Brad |
-| **Grok xAI API** | Real-time sports intelligence for Brad |
-| **Senate/House Stock Watcher** | STOCK Act disclosure feeds for Rugrat |
-| **Yahoo Finance** | Live stock prices for Jordan |
-| **ESPN API** | Live scoreboards for Brad |
-| **requests** | All HTTP — synchronous, no async |
-| **cryptography** | RSA-PSS signing for Kalshi |
-| **scipy** | Normal CDF for weather edge calculation |
+| Python 3.11+ | All agents — threading only, no async |
+| Raspberry Pi 5 | Production host, `stratton-firm.service` via systemd |
+| Kalshi API | RSA-PSS auth, 5,200+ markets scanned |
+| Discord API | REST only, one bot token per agent |
+| FRED API | GDPNow, CPI, PCE series |
+| Tomorrow.io | Temperature forecasts (500/day free tier) |
+| Open-Meteo | Free forecast fallback |
+| NOAA Gridpoint | Tertiary weather source |
+| CoinGecko | BTC/ETH spot prices (free) |
+| The Odds API | Sportsbook probabilities for sports engine |
+| Grok xAI | Real-time sports + market intelligence |
+| Claude (Anthropic) | Deep reasoning, eval critique |
+| GPT-4o (OpenAI) | Shadow checks, general reasoning |
+| ChromaDB | Local vector database for RAG |
+| sentence-transformers | all-MiniLM-L6-v2 embeddings (local, free) |
+| Senate/House Stock Watcher | STOCK Act disclosure feeds |
+| Yahoo Finance | Live stock prices for portfolio + Jordan |
+| ESPN API | Live scoreboards for sports engine |
+| FastAPI + uvicorn | Dashboard backend |
+| Next.js 15 + Tailwind | Dashboard frontend |
 
 ---
 
