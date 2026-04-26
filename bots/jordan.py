@@ -451,6 +451,27 @@ def run_price_monitor(post: bool = True) -> dict:
                 f"⏱ {time_to_close_str()}\n"
                 f"**Book it or trail a stop.**"
             )
+            # LLM exit analysis when target hit
+            try:
+                import sys as _sys_jrd
+                if '/home/cody/stratton/bots' not in _sys_jrd.path:
+                    _sys_jrd.path.insert(0, '/home/cody/stratton/bots')
+                from llm_client import llm_reason, options_setup_prompt
+                _et_now    = now_et()
+                _close_dt  = _et_now.replace(hour=16, minute=0, second=0, microsecond=0)
+                _mins_left = max(0, int((_close_dt - _et_now).total_seconds() / 60))
+                _jrd_prompt = options_setup_prompt(
+                    ticker            = "SPY",
+                    option_type       = opt_type,
+                    current_price     = spy_price,
+                    target            = target,
+                    time_to_close_mins= _mins_left,
+                )
+                _jrd_result = llm_reason(_jrd_prompt, primary="grok")
+                if _jrd_result.get("reasoning"):
+                    msg += "\n🧠 **Jordan’s Take:** " + _jrd_result.get("reasoning", "")[:300]
+            except Exception as _jrd_err:
+                pass  # LLM failure never blocks alerts
             hits.append(msg)
             for p in positions:
                 if p.get('id') == pos.get('id'):

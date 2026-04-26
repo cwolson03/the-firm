@@ -8,6 +8,7 @@ State persisted atomically to /home/cody/stratton/data/shared_state.json
 import os
 import json
 import time
+import fcntl
 
 SHARED_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'data', 'shared_state.json')
 
@@ -36,25 +37,28 @@ def _save_state(state: dict):
 
 
 def write_agent_status(agent_name: str, status_dict: dict):
-    """
-    Update agent_status[agent_name] in shared_state.json.
-    Always adds last_run (ISO UTC timestamp) and last_run_ts (unix epoch).
+    """Thread-safe atomic write via flock + rename."""
+    lock_path = SHARED_STATE_FILE + '.lock'
+    try:
+        os.makedirs(os.path.dirname(SHARED_STATE_FILE), exist_ok=True)
+        with open(lock_path, 'w') as lock_file:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)  # exclusive lock
+            state = _load_state()
+            if 'agent_status' not in state:
+                state['agent_status'] = {}
 
-    Usage:
-        write_agent_status('jordan', {'positions_checked': 3, 'alerts_fired': 1})
-    """
-    state = _load_state()
-    if 'agent_status' not in state:
-        state['agent_status'] = {}
-
-    now = time.time()
-    entry = {
-        'last_run': _iso_now(),
-        'last_run_ts': now,
-    }
-    entry.update(status_dict)
-    state['agent_status'][agent_name] = entry
-    _save_state(state)
+            now = time.time()
+            entry = {
+                'last_run': _iso_now(),
+                'last_run_ts': now,
+            }
+            entry.update(status_dict)
+            state['agent_status'][agent_name] = entry
+            _save_state(state)
+            # lock released when 'with' block exits
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f'[shared_context] write_agent_status failed for {agent_name}: {e}')
 
 
 def read_agent_status(agent_name: str = None) -> dict:

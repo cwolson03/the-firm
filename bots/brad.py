@@ -2063,6 +2063,13 @@ def check_paper_fills(dry_run: bool = False):
             changed = True
             log.info(f"[Paper] [{strategy.upper()}] {ticker} expired unfilled — stink price never hit")
 
+        # Catch open bids where Kalshi finalized early (close_time parse failures)
+        elif trade["status"] == "open" and m and m.get("status") in ("finalized", "determined"):
+            trade["status"] = "expired_unfilled"
+            trade["result"] = m.get("result", "finalized_unfilled")
+            changed = True
+            log.info(f"[Paper] [{strategy.upper()}] {ticker} — market finalized, clearing stale open bid")
+
     if changed:
         _save_paper_trades(trades)
 

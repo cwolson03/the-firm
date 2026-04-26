@@ -157,8 +157,33 @@ THESIS_DIRECTION_LOCK = {
     "KXGDP-26APR30-T2.5": "NO",    # GDPNow 1.31% < 2.5% — NO wins
     "KXGDP-26APR30-T3.0": "NO",    # GDPNow 1.31% < 3.0% — NO wins
 }
+def _get_active_thesis_locks() -> dict:
+    """Return thesis locks, filtering out entries past their close date."""
+    from datetime import date
+    today = date.today()
+    active = {}
+    for ticker, lock_data in THESIS_DIRECTION_LOCK.items():
+        try:
+            date_match = re.search(r'-(\d{2})([A-Z]{3})(\d{2})-', ticker)
+            if date_match:
+                day = int(date_match.group(1))
+                month_str = date_match.group(2)
+                year = 2000 + int(date_match.group(3))
+                month_map = {'JAN':1,'FEB':2,'MAR':3,'APR':4,'MAY':5,'JUN':6,
+                             'JUL':7,'AUG':8,'SEP':9,'OCT':10,'NOV':11,'DEC':12}
+                month = month_map.get(month_str, 0)
+                if month and date(year, month, day) < today:
+                    log.info(f'[THESIS] Expiring lock for {ticker} (past close date {year}-{month:02d}-{day:02d})')
+                    continue  # Skip expired
+        except Exception:
+            pass
+        active[ticker] = lock_data
+    return active
+
 POLY_FETCH_LIMIT       = 200
 POLY_MATCH_MIN_WORDS   = 2   # lowered from 3 — catches more valid matches
+
+POLYMARKET_ENABLED = False  # Set True when Polymarket integration is ready
 
 # Stop-loss config for open positions
 STOP_LOSS_RULES = {
@@ -259,6 +284,42 @@ crypto_signals: dict = {}
 # {order_id: {ticker, direction, price_c, contracts, cost}}
 _known_resting: dict = {}
 
+_orderbook_boost_count = 0
+
+# ── State persistence (survives module reloads by firm.py) ─────────────────
+_DONNIE_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'data')
+DONNIE_STATE_FILE = os.path.join(_DONNIE_DATA_DIR, 'donnie_state.json')
+
+def _save_donnie_state():
+    """Persist in-memory state that must survive module reloads."""
+    try:
+        state = {
+            'known_resting': {k: v for k, v in _known_resting.items()},
+            'last_tier2_snapshot': {k: v for k, v in last_tier2_snapshot.items()} if last_tier2_snapshot else {},
+            'saved_at': datetime.now(timezone.utc).isoformat()
+        }
+        os.makedirs(os.path.dirname(DONNIE_STATE_FILE), exist_ok=True)
+        tmp = DONNIE_STATE_FILE + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(state, f, indent=2)
+        os.replace(tmp, DONNIE_STATE_FILE)
+    except Exception as e:
+        log.warning(f'[STATE] Save failed: {e}')
+
+def _load_donnie_state():
+    """Restore state from disk on module load."""
+    global _known_resting, last_tier2_snapshot
+    try:
+        if os.path.exists(DONNIE_STATE_FILE):
+            with open(DONNIE_STATE_FILE) as f:
+                state = json.load(f)
+            _known_resting.update(state.get('known_resting', {}))
+            if state.get('last_tier2_snapshot'):
+                last_tier2_snapshot.update(state['last_tier2_snapshot'])
+            log.info(f'[STATE] Loaded: {len(_known_resting)} resting orders, {len(last_tier2_snapshot)} tier2 snapshots')
+    except Exception as e:
+        log.warning(f'[STATE] Load failed: {e}')
+
 # ─────────────────────────────────────────────────────────────────────────────
 # LOGGING
 # ─────────────────────────────────────────────────────────────────────────────
@@ -274,6 +335,12 @@ _sh  = logging.StreamHandler(sys.stdout)
 _sh.setFormatter(_fmt)
 log.addHandler(_fh)
 log.addHandler(_sh)
+
+# Restore persisted state from disk
+try:
+    _load_donnie_state()
+except Exception:
+    pass
 
 # ─────────────────────────────────────────────────────────────────────────────
 # AUTH — RSA-PSS (unchanged from v2)
@@ -1534,7 +1601,7 @@ def run_polymarket_sync(watchlist_markets: list = None, dry_run: bool = False) -
     # Polymarket arb alerts disabled — fuzzy matching produces false positives
     # Polymarket has no GDP markets; spurious matches generate garbage alerts
     # Re-enable when exact market ID matching is implemented
-    if False and arbs:
+    if POLYMARKET_ENABLED and arbs:
         lines = ["🔀 **POLYMARKET ARB ALERT**", ""]
         for arb in arbs[:5]:  # top 5
             k_c = int(arb["kalshi_mid"] * 100)
@@ -1758,6 +1825,7 @@ def analyze_order_book(m: dict) -> float:
     Lopsided YES bid (more buyers than sellers) = smart money accumulating YES.
     Lopsided NO bid (more sellers than buyers) = smart money accumulating NO.
     """
+    global _orderbook_boost_count
     yes_bid_size = float(m.get("yes_bid_size_fp") or 0)
     yes_ask_size = float(m.get("yes_ask_size_fp") or 0)
 
@@ -1774,17 +1842,22 @@ def analyze_order_book(m: dict) -> float:
         f"bid_pct={bid_pct:.2f}"
     )
 
+    result = 0.0
     if bid_pct > 0.75:  # heavy YES accumulation
         log.info(f"[OrderBook] {ticker} HEAVY YES ACCUMULATION bid_pct={bid_pct:.2f} → +0.15 boost")
-        return 0.15
+        result = 0.15
     elif bid_pct > 0.65:
         log.info(f"[OrderBook] {ticker} YES LEAN bid_pct={bid_pct:.2f} → +0.08 boost")
-        return 0.08
+        result = 0.08
     elif bid_pct < 0.25:  # heavy NO accumulation (selling pressure on YES)
         log.info(f"[OrderBook] {ticker} HEAVY NO ACCUMULATION bid_pct={bid_pct:.2f} → +0.08 boost")
-        return 0.08  # could be smart money on NO side
-    else:
-        return 0.0
+        result = 0.08  # could be smart money on NO side
+
+    if result > 0:
+        _orderbook_boost_count += 1
+        if _orderbook_boost_count <= 5:  # Log first 5 hits
+            log.info(f'[OB] Order book boost fired! count={_orderbook_boost_count}, score={result:.3f}')
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2504,7 +2577,7 @@ def should_execute(signal: dict, balance: float, positions: dict, total_exposure
         return False, f"already have open position in {ticker}"
 
     # Thesis direction lock — never trade against hard-coded thesis
-    locked_direction = THESIS_DIRECTION_LOCK.get(ticker)
+    locked_direction = _get_active_thesis_locks().get(ticker)
     if locked_direction and direction.upper() != locked_direction:
         return False, f"thesis lock: {ticker} must be {locked_direction}, signal says {direction}"
 
@@ -2711,7 +2784,14 @@ def run_execution_check(plays: list, dry_run: bool = False):
                             ),
                             macro_context = "Tariff environment, Iran energy shock, Fed on hold",
                         )
-                        _g6_result = llm_reason(_g6_prompt, primary="grok", shadow=None)
+                        # Shadow consensus for high-edge trades (>30pt)
+                        _use_shadow = _econ_edge_g6 > 0.30
+                        _g6_result = llm_reason(
+                            _g6_prompt,
+                            primary="grok",
+                            shadow="claude" if _use_shadow else None,
+                            require_consensus=_use_shadow
+                        )
                         if not _g6_result.get("go", True):  # default True if LLM fails
                             _g6_reason = _g6_result.get('reasoning', 'no reason')[:100]
                             log.info(f"[DONNIE] LLM gate BLOCKED {_g6_ticker}: {_g6_reason}")
@@ -2846,10 +2926,11 @@ def run_discovery_scan(dry_run: bool = False) -> tuple:
 
     # Polymarket arb (use cached if fresh enough)
     arb_opps = []
-    if polymarket_cache:
-        arb_opps = find_polymarket_arb(watchlist, polymarket_cache)
-    else:
-        arb_opps = run_polymarket_sync(watchlist, dry_run=dry_run)
+    if POLYMARKET_ENABLED:
+        if polymarket_cache:
+            arb_opps = find_polymarket_arb(watchlist, polymarket_cache)
+        else:
+            arb_opps = run_polymarket_sync(watchlist, dry_run=dry_run)
 
     # Silent mode — only post to Discord on trade execution or arb alerts
     # Scan reports are suppressed to avoid noise. Daily heartbeat handled separately.
@@ -2862,6 +2943,8 @@ def run_discovery_scan(dry_run: bool = False) -> tuple:
 
     # Execution check
     run_execution_check(plays, dry_run=dry_run)
+
+    log.info(f'[SCAN] Order book boost fired {_orderbook_boost_count} times this session')
 
     return all_markets, plays, weather_signals, arb_opps
 
@@ -2909,6 +2992,7 @@ def check_order_fills(dry_run: bool = False):
 
         # Update known resting
         _known_resting = resting
+        _save_donnie_state()
 
     except Exception as e:
         log.debug(f"[FILL] check_order_fills error: {e}")
@@ -3940,11 +4024,11 @@ def main():
 
         # Weather is Mark Hanna/weather.py's domain — Donnie does not scan or execute weather
 
-        if now - last_polymarket >= POLYMARKET_REFRESH_INTERVAL_SEC * interval_multiplier:
+        if POLYMARKET_ENABLED and now - last_polymarket >= POLYMARKET_REFRESH_INTERVAL_SEC * interval_multiplier:
             run_polymarket_sync(watchlist, dry_run=dry_run)
             last_polymarket = time.time()
 
-        if now - last_smart_money_ts >= SMART_MONEY_INTERVAL_SEC * interval_multiplier:
+        if POLYMARKET_ENABLED and now - last_smart_money_ts >= SMART_MONEY_INTERVAL_SEC * interval_multiplier:
             run_smart_money_tracker(dry_run=dry_run)
             last_smart_money_ts = time.time()
 
@@ -3976,6 +4060,7 @@ def main():
 def run_scan(post=None, **kwargs):
     """Entry point for firm.py orchestrator. Runs a single discovery scan."""
     run_discovery_scan(dry_run=False)
+    _save_donnie_state()
     try:
         import sys as _sys, os as _os
         _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))

@@ -198,42 +198,59 @@ def post_discord(channel_id: int, content: str, demo: bool = False) -> bool:
 # ── Data Fetchers ────────────────────────────────────────────────────────────
 def fetch_senate_trades() -> list:
     print("[RUGRAT] Fetching Senate trades...")
-    try:
-        r = requests.get(SENATE_URL, headers=HEADERS, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        trades = []
-        for senator in data:
-            name = (senator.get('first_name', '') + ' ' + senator.get('last_name', '')).strip()
-            for tx in senator.get('transactions', []):
-                tx = dict(tx)
-                tx['_name']    = name
-                tx['_chamber'] = 'Senate'
-                trades.append(tx)
-        print(f"[RUGRAT] Fetched {len(trades)} Senate transactions")
-        return trades
-    except Exception as e:
-        print(f"[RUGRAT] Senate fetch error: {e}", file=sys.stderr)
-        return []
+    # Try multiple sources in order of reliability
+    sources = [
+        ('s3-west', 'https://senate-stock-watcher-data.s3.us-west-2.amazonaws.com/aggregate/all_transactions.json'),
+        ('s3-east', SENATE_URL),
+    ]
+    for label, url in sources:
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=30, allow_redirects=True)
+            if r.status_code == 200 and len(r.content) > 1000:
+                data = r.json()
+                trades = []
+                for senator in data:
+                    name = (senator.get('first_name', '') + ' ' + senator.get('last_name', '')).strip()
+                    for tx in senator.get('transactions', []):
+                        tx = dict(tx)
+                        tx['_name']    = name
+                        tx['_chamber'] = 'Senate'
+                        trades.append(tx)
+                print(f"[RUGRAT] Fetched {len(trades)} Senate transactions (source: {label})")
+                return trades
+            else:
+                print(f"[RUGRAT] Senate source {label} returned {r.status_code}", file=sys.stderr)
+        except Exception as e:
+            print(f"[RUGRAT] Senate source {label} error: {e}", file=sys.stderr)
+    print("[RUGRAT] WARNING: All Senate sources failed — returning empty list", file=sys.stderr)
+    return []
 
 
 def fetch_house_trades() -> list:
     print("[RUGRAT] Fetching House trades...")
-    try:
-        r = requests.get(HOUSE_URL, headers=HEADERS, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        trades = []
-        for tx in data:
-            tx = dict(tx)
-            tx['_name']    = tx.get('representative', 'Unknown Rep')
-            tx['_chamber'] = 'House'
-            trades.append(tx)
-        print(f"[RUGRAT] Fetched {len(trades)} House transactions")
-        return trades
-    except Exception as e:
-        print(f"[RUGRAT] House fetch error: {e}", file=sys.stderr)
-        return []
+    sources = [
+        ('s3-west', 'https://house-stock-watcher-data.s3.us-west-2.amazonaws.com/data/all_transactions.json'),
+        ('s3-east', HOUSE_URL),
+    ]
+    for label, url in sources:
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=30, allow_redirects=True)
+            if r.status_code == 200 and len(r.content) > 1000:
+                data = r.json()
+                trades = []
+                for tx in data:
+                    tx = dict(tx)
+                    tx['_name']    = tx.get('representative', 'Unknown Rep')
+                    tx['_chamber'] = 'House'
+                    trades.append(tx)
+                print(f"[RUGRAT] Fetched {len(trades)} House transactions (source: {label})")
+                return trades
+            else:
+                print(f"[RUGRAT] House source {label} returned {r.status_code}", file=sys.stderr)
+        except Exception as e:
+            print(f"[RUGRAT] House source {label} error: {e}", file=sys.stderr)
+    print("[RUGRAT] WARNING: All House sources failed — returning empty list", file=sys.stderr)
+    return []
 
 
 def fetch_all_trades() -> list:
@@ -246,24 +263,57 @@ def normalize_name(name: str) -> str:
     return name.lower().strip()
 
 
+def _strip_title(name: str) -> str:
+    """Strip congressional titles and normalize name."""
+    prefixes = ['rep.', 'sen.', 'senator', 'representative', 'hon.', 'honorable']
+    n = name.strip().lower()
+    for p in prefixes:
+        if n.startswith(p):
+            n = n[len(p):].strip()
+    return n
+
+
 def match_member(raw_name: str) -> str | None:
-    """Match a raw name from the API to a WATCHED_MEMBERS key."""
-    raw_norm = normalize_name(raw_name)
+    """Match a raw name from the API to a WATCHED_MEMBERS key.
+    Handles: 'Nancy Pelosi', 'Pelosi, Nancy', 'Rep. Nancy Pelosi', 'Pelosi'
+    """
+    if not raw_name:
+        return None
+    # Strip title prefixes
+    stripped = _strip_title(raw_name)
+
+    # Handle "Last, First" format -> convert to "First Last"
+    if ',' in stripped:
+        parts = [p.strip() for p in stripped.split(',', 1)]
+        first_last = f"{parts[1]} {parts[0]}".strip()
+    else:
+        first_last = stripped
+
+    # Normalize
+    raw_norm = normalize_name(first_last)
+    raw_parts = raw_norm.split()
+    raw_last  = raw_parts[-1] if raw_parts else ''
+    raw_first = raw_parts[0] if raw_parts else ''
+
     for watched in WATCHED_MEMBERS:
         w_norm = normalize_name(watched)
-        # Exact match
+        w_parts = w_norm.split()
+        w_last  = w_parts[-1] if w_parts else ''
+        w_first = w_parts[0] if w_parts else ''
+
+        # Exact full name match
         if raw_norm == w_norm:
             return watched
-        # Both-direction partial: "pelosi" in "nancy pelosi"
-        parts = w_norm.split()
-        raw_parts = raw_norm.split()
-        last_name = parts[-1] if parts else ''
-        raw_last  = raw_parts[-1] if raw_parts else ''
-        if last_name and raw_last and last_name == raw_last:
+        # "First Last" both match
+        if raw_first == w_first and raw_last == w_last and raw_first:
             return watched
-        # One name contains the other
+        # Last name match (single token)
+        if raw_last and raw_last == w_last and len(raw_parts) <= 2:
+            return watched
+        # Original name substring check
         if w_norm in raw_norm or raw_norm in w_norm:
             return watched
+
     return None
 
 
@@ -643,6 +693,62 @@ def format_high_conviction_alert(trade: dict, scored: dict, stock_data: dict, ne
     portfolio_str = scored.get('portfolio_str', 'None')
     watchlist_str = scored.get('watchlist_str', 'No')
 
+    # RAG context retrieval — enriches LLM prompt with historical data
+    rag_context = {}
+    try:
+        import sys as _rag_sys
+        if '/home/cody/stratton/bots' not in _rag_sys.path:
+            _rag_sys.path.insert(0, '/home/cody/stratton/bots')
+        from rag_store import search as rag_search
+        rag_context = rag_search(
+            member=member_name,
+            ticker=ticker,
+            trade_type=tx_type,
+            n_results=5
+        )
+    except Exception as _rag_err:
+        pass  # RAG failure never blocks alerts
+
+    # Build RAG summary for LLM prompt enrichment
+    rag_summary = ''
+    if rag_context.get('prior_disclosures'):
+        rag_summary = '\n\nHistorical context (retrieved):\n'
+        for _i, (_disc, _outcome) in enumerate(zip(
+            rag_context['prior_disclosures'][:3],
+            rag_context['prior_outcomes'][:3]
+        )):
+            rag_summary += f'{_i+1}. {_disc[:150]}'
+            if _outcome:
+                rag_summary += f' → {_outcome}'
+            rag_summary += '\n'
+        if rag_context.get('member_profile'):
+            rag_summary += f'\nMember profile: {rag_context["member_profile"][:200]}'
+
+    # Generate LLM brief for high-conviction trades
+    llm_section = ""
+    try:
+        import sys as _sys_rug
+        if '/home/cody/stratton/bots' not in _sys_rug.path:
+            _sys_rug.path.insert(0, '/home/cody/stratton/bots')
+        from llm_client import llm_reason, congressional_brief_prompt
+        _rug_info     = WATCHED_MEMBERS.get(member_name, {})
+        _rug_prompt   = congressional_brief_prompt(
+            member    = member_name,
+            ticker    = ticker,
+            trade_type= tx_type,
+            amount    = amount,
+            score     = scored.get('total', score),
+            committee = _rug_info.get('committees', ['Unknown'])[0],
+            specialty = _rug_info.get('specialty', ''),
+        ) + rag_summary
+        _rug_result = llm_reason(_rug_prompt, primary="grok")
+        if _rug_result.get("ok") or _rug_result.get("reasoning"):
+            llm_section = "\n\n🧠 **LLM Analysis:**\n" + _rug_result.get("reasoning", "")[:400]
+            if _rug_result.get("risks"):
+                llm_section += "\n⚠️ Risks: " + ", ".join(_rug_result["risks"][:3])
+    except Exception as _rug_err:
+        pass  # LLM failure never blocks alerts
+
     lines = [
         f"🏛️ **RUGRAT ALERT** — Congressional Trade Detected",
         f"",
@@ -666,6 +772,7 @@ def format_high_conviction_alert(trade: dict, scored: dict, stock_data: dict, ne
         take,
         f"",
         f"🔗 **Source:** congress.gov disclosure | {'Senate' if trade.get('_chamber') == 'Senate' else 'House'} Stock Watcher",
+        llm_section if llm_section else None,
     ]
     return "\n".join(l for l in lines if l is not None)
 
