@@ -46,11 +46,13 @@ from fastapi.responses import RedirectResponse
 async def root():
     return RedirectResponse(url="/docs")
 
+# Lock CORS to dashboard origins. Set CORS_ORIGINS env var for production.
+_cors_origins = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://localhost:3001").split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[o.strip() for o in _cors_origins],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET"],
     allow_headers=["*"],
 )
 
@@ -463,7 +465,7 @@ async def rag_demo(
     trade_type: str = Query("Purchase"),
 ):
     import importlib
-    os.chdir("/home/cody/stratton")
+    # use absolute paths
     from dotenv import load_dotenv
     load_dotenv(str(BOT_TOKENS))
 
@@ -565,7 +567,7 @@ async def get_file(path: str = Query(...)):
     """Serve bot file contents for the dashboard file viewer."""
     ALLOWED_BASE = Path("/home/cody/stratton/bots")
     requested = (ALLOWED_BASE / path).resolve()
-    if not str(requested).startswith(str(ALLOWED_BASE)):
+    if not requested.is_relative_to(ALLOWED_BASE):
         return {"error": "Access denied"}
     if not requested.exists() or not requested.is_file():
         return {"error": "File not found"}
