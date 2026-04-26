@@ -1,0 +1,7 @@
+{
+  "snapshot_date": "2026-04-26",
+  "snapshot_label": "Apr 26, 2026",
+  "note": "Live data snapshot from Atlas. The RAG Stock Finder is the only feature making real-time API calls.",
+  "live_features": ["rag-demo"],
+  "static_features": ["positions", "weather", "sports", "portfolio", "activity"]
+}

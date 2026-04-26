@@ -1,36 +1,38 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# The Firm — Dashboard
 
-## Getting Started
+A 7-tab Next.js dashboard for The Firm trading system.
 
-First, run the development server:
+**Live demo:** see parent repo README for Vercel URL.
+
+## Tabs
+
+| Tab | What it shows |
+|-----|--------------|
+| Overview | Agent status grid, live activity feed |
+| Economics | Open Kalshi positions, trade history, LLM reasoning |
+| Weather | Temperature market performance, 19 cities |
+| Sports | Stink-bid paper trades by strategy |
+| Intelligence | Congressional watchlist, RAG Stock Finder |
+| Portfolio | Live equity positions, Roth IRA |
+| System | Service health, file viewer, performance analytics |
+
+## Run locally
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+npm install
+
+# Against live API
+NEXT_PUBLIC_API_URL=http://your-api:8000 npm run dev
+
+# With fixture data (no API required)
+NEXT_PUBLIC_USE_FIXTURES=true npm run dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open [http://localhost:3000](http://localhost:3000).
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Fixture mode
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
-
-## Learn More
-
-To learn more about Next.js, take a look at the following resources:
-
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+`public/data/*.json` contains real snapshots from the live system. Set
+`NEXT_PUBLIC_USE_FIXTURES=true` to serve these instead of calling the API.
+The **Stock Finder** (Intelligence tab) always calls the live API regardless
+of fixture mode — it's the only feature making real-time LLM calls.
