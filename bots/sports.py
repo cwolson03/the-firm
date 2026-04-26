@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-BRAD — Kalshi Sports Prediction Market Stink Bid Bot
+SPORTS — Kalshi Sports Prediction Market Stink Bid Bot
 ======================================================
 Stratton Oakmont prediction market intelligence — sports division.
 
@@ -785,7 +785,7 @@ def get_balance() -> float:
     data = kalshi_get("/portfolio/balance")
     balance_cents   = data.get("balance", 0.0)
     balance_dollars = float(balance_cents) / 100.0
-    log.info(f"[Brad] Portfolio balance: ${balance_dollars:.2f} (raw: {balance_cents})")
+    log.info(f"[Sports] Portfolio balance: ${balance_dollars:.2f} (raw: {balance_cents})")
     return balance_dollars
 
 
@@ -814,7 +814,7 @@ def get_all_open_positions_exposure() -> float:
         remaining = float(order.get("remaining_count", 0) or 0)
         total    += (price_c / 100.0) * remaining
 
-    log.info(f"[Brad] Total account exposure (all bots): ${total:.2f}")
+    log.info(f"[Sports] Total account exposure (all bots): ${total:.2f}")
     return total
 
 
@@ -829,7 +829,7 @@ def get_sports_markets(max_days: int = None) -> list:
     if max_days is None:
         max_days = MAX_DAYS_UNTIL_CLOSE
 
-    log.info(f"[Brad] Fetching Sports markets (max_days={max_days})...")
+    log.info(f"[Sports] Fetching Sports markets (max_days={max_days})...")
     sports_markets = []
     cursor = None
     page   = 0
@@ -857,7 +857,7 @@ def get_sports_markets(max_days: int = None) -> list:
 
             # Hard filter: only Sports category — exclude gas, political, etc.
             if cat.lower() != "sports":
-                log.debug(f"[Brad] Skipping non-Sports event: {event.get('event_ticker','?')} (category={cat!r})")
+                log.debug(f"[Sports] Skipping non-Sports event: {event.get('event_ticker','?')} (category={cat!r})")
                 continue
 
             for m in markets:
@@ -882,7 +882,7 @@ def get_sports_markets(max_days: int = None) -> list:
         if not cursor or len(events) < 200:
             break
 
-    log.info(f"[Brad] Found {len(sports_markets)} qualifying Sports markets across {page} pages")
+    log.info(f"[Sports] Found {len(sports_markets)} qualifying Sports markets across {page} pages")
     return sports_markets
 
 
@@ -1075,7 +1075,7 @@ def find_favorites(markets: list, live_keywords: set = None, today_keywords: set
 
         # ── Step 3: Blocked ticker guard ────────────────────────────────────
         if any(ticker.upper().startswith(p) for p in BLOCKED_TICKER_PREFIXES):
-            log.debug(f"[Brad] Blocked ticker: {ticker}")
+            log.debug(f"[Sports] Blocked ticker: {ticker}")
             continue
 
         # ── Step 4: Detect sport type ────────────────────────────────────────
@@ -1439,9 +1439,9 @@ def get_open_brad_orders() -> dict:
             ticker = order.get("ticker", "")
             if ticker:
                 brad_orders[ticker] = order
-                log.debug(f"[Brad] Open order: {ticker} @ {order.get('yes_price',0)}¢ x{order.get('remaining_count',0)}")
+                log.debug(f"[Sports] Open order: {ticker} @ {order.get('yes_price',0)}¢ x{order.get('remaining_count',0)}")
 
-    log.info(f"[Brad] Found {len(brad_orders)} open Brad orders")
+    log.info(f"[Sports] Found {len(brad_orders)} open Brad orders")
     return brad_orders
 
 
@@ -1481,7 +1481,7 @@ def get_open_brad_orders_by_strategy(paper: bool = False) -> dict:
                 by_strategy["s1"][ticker] = order
 
     for s, orders_dict in by_strategy.items():
-        log.info(f"[Brad] Open {s.upper()} orders: {len(orders_dict)}")
+        log.info(f"[Sports] Open {s.upper()} orders: {len(orders_dict)}")
 
     return by_strategy
 
@@ -1621,9 +1621,9 @@ def cancel_order(order_id: str) -> bool:
     """Cancel an open order by order_id."""
     ok = kalshi_delete(f"/portfolio/orders/{order_id}")
     if ok:
-        log.info(f"[Brad] Cancelled order {order_id}")
+        log.info(f"[Sports] Cancelled order {order_id}")
     else:
-        log.warning(f"[Brad] Failed to cancel order {order_id}")
+        log.warning(f"[Sports] Failed to cancel order {order_id}")
     return ok
 
 
@@ -1634,13 +1634,13 @@ def refresh_stink_bids(open_orders: dict, markets: list, balance: float, dry_run
     Detects strategy from client_order_id prefix to apply correct discount.
     """
     if not open_orders:
-        log.info("[Brad] No open orders to refresh")
+        log.info("[Sports] No open orders to refresh")
         return
 
     # Build ticker → market lookup
     market_by_ticker = {m.get("ticker", ""): m for m in markets}
 
-    log.info(f"[Brad] Refreshing {len(open_orders)} stink bids...")
+    log.info(f"[Sports] Refreshing {len(open_orders)} stink bids...")
 
     for ticker, order in list(open_orders.items()):
         order_id     = order.get("order_id", "")
@@ -1657,26 +1657,26 @@ def refresh_stink_bids(open_orders: dict, markets: list, balance: float, dry_run
 
         # Check if already filled
         if order_status == "filled":
-            log.info(f"[Brad] Order {ticker} already filled — skipping cancel")
+            log.info(f"[Sports] Order {ticker} already filled — skipping cancel")
             continue
 
         # Cancel existing order
         if order_id and not dry_run:
             cancel_order(order_id)
         elif dry_run:
-            log.info(f"[Brad] [DRY] Would cancel {ticker} order_id={order_id}")
+            log.info(f"[Sports] [DRY] Would cancel {ticker} order_id={order_id}")
 
         # Re-place if we still have market data
         m = market_by_ticker.get(ticker)
         if not m:
-            log.info(f"[Brad] {ticker} no longer in sports markets — not re-placing")
+            log.info(f"[Sports] {ticker} no longer in sports markets — not re-placing")
             continue
 
         # Check market is still open and within time horizon
         d         = days_until_close(m)
         max_days  = MAX_DAYS_UNTIL_CLOSE_S3 if strategy == "s3" else MAX_DAYS_UNTIL_CLOSE
         if d > max_days or d < 0:
-            log.info(f"[Brad] {ticker} closing in {d:.1f} days — outside {strategy} window, not re-placing")
+            log.info(f"[Sports] {ticker} closing in {d:.1f} days — outside {strategy} window, not re-placing")
             continue
 
         # Re-calculate favorite at current price
@@ -1695,7 +1695,7 @@ def refresh_stink_bids(open_orders: dict, markets: list, balance: float, dry_run
             fav_price = no_mid
             fav_side  = "NO"
         else:
-            log.info(f"[Brad] {ticker} no longer has a clear {strategy} favorite — not re-placing")
+            log.info(f"[Sports] {ticker} no longer has a clear {strategy} favorite — not re-placing")
             continue
 
         fav = {
@@ -1713,7 +1713,7 @@ def refresh_stink_bids(open_orders: dict, markets: list, balance: float, dry_run
         time.sleep(0.3)
         result = place_stink_bid(fav, balance, dry_run=dry_run, strategy=strategy)
         if result:
-            log.info(f"[Brad] Re-placed {strategy} stink bid: {ticker} @ {result['stink_price_c']}¢")
+            log.info(f"[Sports] Re-placed {strategy} stink bid: {ticker} @ {result['stink_price_c']}¢")
         time.sleep(0.3)
 
 
@@ -2218,7 +2218,7 @@ def check_and_notify_fills(dry_run: bool = False):
         if order_id and order_id not in _notified_fills:
             _notified_fills.add(order_id)
             msg = format_fill_notification(order)
-            log.info(f"[Brad] FILLED: {order.get('ticker','?')} — posting notification")
+            log.info(f"[Sports] FILLED: {order.get('ticker','?')} — posting notification")
             post_discord(msg, channel_id=BRAD_DISCORD_CH, dry_run=dry_run)
             time.sleep(0.5)
 
@@ -2243,13 +2243,13 @@ def run_brad_scan(dry_run: bool = False, paper: bool = True):
     """
     log.info("=" * 60)
     mode_label = "DRY RUN" if dry_run else ("PAPER" if paper else "LIVE")
-    log.info(f"[Brad] Starting multi-strategy sports scan [{mode_label}]...")
+    log.info(f"[Sports] Starting multi-strategy sports scan [{mode_label}]...")
     log.info("=" * 60)
 
     # Get current balance
     balance = get_balance()
     if balance <= 0:
-        log.warning("[Brad] Zero balance — skipping scan")
+        log.warning("[Sports] Zero balance — skipping scan")
         return
 
     # ── SHARED CAPITAL CAP (NON-NEGOTIABLE) ──────────────────────────────────
@@ -2266,7 +2266,7 @@ def run_brad_scan(dry_run: bool = False, paper: bool = True):
     brad_total_exposure = get_total_brad_exposure(all_open_orders)
 
     log.info(
-        f"[Brad] Capital check: balance=${balance:.2f} | "
+        f"[Sports] Capital check: balance=${balance:.2f} | "
         f"account_exposure=${total_account_exposure:.2f} | "
         f"brad_total_exposure=${brad_total_exposure:.2f} | "
         f"brad_hard_cap=${brad_hard_cap:.2f} ({BRAD_MAX_BALANCE_PCT:.0%})"
@@ -2281,7 +2281,7 @@ def run_brad_scan(dry_run: bool = False, paper: bool = True):
     s3_cap      = balance * STRATEGY_CAPS["s3"]
 
     log.info(
-        f"[Brad] Strategy caps: "
+        f"[Sports] Strategy caps: "
         f"S1=${s1_exposure:.2f}/${s1_cap:.2f} ({STRATEGY_CAPS['s1']:.0%}) | "
         f"S2=${s2_exposure:.2f}/${s2_cap:.2f} ({STRATEGY_CAPS['s2']:.0%}) | "
         f"S3=${s3_exposure:.2f}/${s3_cap:.2f} ({STRATEGY_CAPS['s3']:.0%})"
@@ -2289,7 +2289,7 @@ def run_brad_scan(dry_run: bool = False, paper: bool = True):
 
     if brad_total_exposure >= brad_hard_cap:
         log.info(
-            f"[Brad] Brad hard cap reached: ${brad_total_exposure:.2f} >= ${brad_hard_cap:.2f} — "
+            f"[Sports] Brad hard cap reached: ${brad_total_exposure:.2f} >= ${brad_hard_cap:.2f} — "
             f"skipping all new bids"
         )
         if paper:
@@ -2303,13 +2303,13 @@ def run_brad_scan(dry_run: bool = False, paper: bool = True):
         scoreboards    = fetch_espn_scoreboards()
         espn_available = bool(scoreboards)
     except Exception as e:
-        log.debug(f"[Brad] ESPN unavailable: {e}")
+        log.debug(f"[Sports] ESPN unavailable: {e}")
         scoreboards    = {}
         espn_available = False
 
     live_keywords, today_keywords = get_live_game_tickers(scoreboards) if espn_available else (set(), set())
     if live_keywords:
-        log.info(f"[Brad] Live game keywords ({len(live_keywords)}): {sorted(live_keywords)[:20]}")
+        log.info(f"[Sports] Live game keywords ({len(live_keywords)}): {sorted(live_keywords)[:20]}")
 
     # ── Fetch markets ─────────────────────────────────────────────────────────
     # S1 + S2 need 7-day window; S3 needs 30-day window
@@ -2321,11 +2321,11 @@ def run_brad_scan(dry_run: bool = False, paper: bool = True):
     markets_s3    = markets_all  # all markets eligible for S3 (up to 30 days)
 
     if not markets_all:
-        log.warning("[Brad] No sports markets found")
+        log.warning("[Sports] No sports markets found")
         return
 
     log.info(
-        f"[Brad] Market pools: S1/S2={len(markets_s1_s2)} (≤7d) | "
+        f"[Sports] Market pools: S1/S2={len(markets_s1_s2)} (≤7d) | "
         f"S3={len(markets_s3)} (≤30d)"
     )
 
@@ -2479,7 +2479,7 @@ def run_brad_scan(dry_run: bool = False, paper: bool = True):
     total_placed = len(placed_s1) + len(placed_s2) + len(placed_s3)
     total_spent  = sum(o.get("cost", 0) for o in placed_s1 + placed_s2 + placed_s3)
     log.info(
-        f"[Brad] Scan complete: S1={len(placed_s1)} S2={len(placed_s2)} S3={len(placed_s3)} | "
+        f"[Sports] Scan complete: S1={len(placed_s1)} S2={len(placed_s2)} S3={len(placed_s3)} | "
         f"total={total_placed} bids | spent=${total_spent:.2f} | "
         f"mode={'paper' if paper else 'live'}"
     )
@@ -2523,14 +2523,14 @@ def run_brad_refresh(dry_run: bool = False, paper: bool = True):
     In paper mode: runs paper fill simulation only (no live orders to cancel/replace).
     """
     log.info("-" * 60)
-    log.info(f"[Brad] Starting stink bid refresh [{'PAPER' if paper else 'LIVE'}]...")
+    log.info(f"[Sports] Starting stink bid refresh [{'PAPER' if paper else 'LIVE'}]...")
     log.info("-" * 60)
 
     if paper or dry_run:
         # Paper mode: just run the fill simulation + expiration check
         check_paper_fills(dry_run=dry_run)
         check_paper_expirations(dry_run=dry_run)
-        log.info("[Brad] Paper refresh complete: checked for simulated fills and expirations")
+        log.info("[Sports] Paper refresh complete: checked for simulated fills and expirations")
         return
 
     # Live mode: cancel and re-place real orders
@@ -2538,12 +2538,12 @@ def run_brad_refresh(dry_run: bool = False, paper: bool = True):
 
     open_orders = get_open_brad_orders()
     if not open_orders:
-        log.info("[Brad] No open Brad orders to refresh")
+        log.info("[Sports] No open Brad orders to refresh")
         return
 
     balance = get_balance()
     if balance <= 0:
-        log.warning("[Brad] Zero balance — skipping refresh")
+        log.warning("[Sports] Zero balance — skipping refresh")
         return
 
     # ── Cricket second-inning cancellation ──────────────────────────────────
@@ -2571,10 +2571,10 @@ def run_brad_refresh(dry_run: bool = False, paper: bool = True):
             cricket_cancelled.append(ticker)
 
     if cricket_cancelled:
-        log.info(f"[Brad] Cancelled {len(cricket_cancelled)} cricket orders in second inning: {cricket_cancelled}")
+        log.info(f"[Sports] Cancelled {len(cricket_cancelled)} cricket orders in second inning: {cricket_cancelled}")
 
     if not open_orders:
-        log.info("[Brad] No remaining open Brad orders after cricket cancellation")
+        log.info("[Sports] No remaining open Brad orders after cricket cancellation")
         return
 
     # Shared capital cap check before re-placing
@@ -2582,7 +2582,7 @@ def run_brad_refresh(dry_run: bool = False, paper: bool = True):
     brad_cap      = balance * BRAD_MAX_BALANCE_PCT
     if brad_exposure >= brad_cap:
         log.info(
-            f"[Brad] Brad capital cap reached during refresh: ${brad_exposure:.2f} >= ${brad_cap:.2f} "
+            f"[Sports] Brad capital cap reached during refresh: ${brad_exposure:.2f} >= ${brad_cap:.2f} "
             f"— cancelling orders without re-placing"
         )
         for ticker, order in open_orders.items():
@@ -2595,7 +2595,7 @@ def run_brad_refresh(dry_run: bool = False, paper: bool = True):
     markets = get_sports_markets(max_days=MAX_DAYS_UNTIL_CLOSE_S3)
 
     refresh_stink_bids(open_orders, markets, balance, dry_run=dry_run)
-    log.info(f"[Brad] Refresh complete: processed {len(open_orders)} orders")
+    log.info(f"[Sports] Refresh complete: processed {len(open_orders)} orders")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2642,7 +2642,7 @@ def main():
     )
 
     if paper and not dry_run:
-        log.info(f"[Brad] Paper trades tracked at: {PAPER_TRADES_FILE}")
+        log.info(f"[Sports] Paper trades tracked at: {PAPER_TRADES_FILE}")
 
     if scan_once:
         run_brad_scan(dry_run=dry_run, paper=paper)
@@ -2658,14 +2658,14 @@ def main():
             try:
                 run_brad_scan(dry_run=dry_run, paper=paper)
             except Exception as e:
-                log.error(f"[Brad] Scan error: {e}", exc_info=True)
+                log.error(f"[Sports] Scan error: {e}", exc_info=True)
             last_scan = time.time()
 
         if now - last_refresh >= REFRESH_INTERVAL_SEC:
             try:
                 run_brad_refresh(dry_run=dry_run, paper=paper)
             except Exception as e:
-                log.error(f"[Brad] Refresh error: {e}", exc_info=True)
+                log.error(f"[Sports] Refresh error: {e}", exc_info=True)
             last_refresh = time.time()
 
         time.sleep(30)

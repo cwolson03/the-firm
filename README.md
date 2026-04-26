@@ -4,13 +4,13 @@
 
 **The architecture in one sentence:** `firm.py` schedules 8 specialized agents, each with its own domain model, LLM reasoning layer, and write access to a shared state file the dashboard reads from.
 
-> **The pitch:** Replace STOCK Act disclosures with any institutional knowledge base — ATS contacts, deal histories, relationship graphs — and the RAG pipeline in `rugrat.py` + `rag_store.py` is the same architecture. The retrieval, the LLM reasoning over retrieved context, the structured output — it all transfers.
+> **The pitch:** Replace STOCK Act disclosures with any institutional knowledge base — ATS contacts, deal histories, relationship graphs — and the RAG pipeline in `congressional.py` + `rag_store.py` is the same architecture. The retrieval, the LLM reasoning over retrieved context, the structured output — it all transfers.
 
 **The four files that demonstrate the interesting engineering:**
 - `bots/rag_store.py` — RAG pipeline over 206 congressional disclosures (ChromaDB + sentence-transformers, multi-query retrieval with reranking)
 - `bots/llm_client.py` — three-model LLM dispatcher (Grok + Claude + GPT-4o) with consensus checking and graceful degradation
 - `bots/eval_framework.py` — post-resolution trade evaluator: scores the *process quality*, not the outcome. A 10/10 process can lose; a 0/10 process can win. They're different things.
-- `bots/donnie_v2.py` — 5+1 gate execution model. Every time we lose money, a new hard gate gets added to the code. The BTC loss story below is the cleanest example.
+- `bots/economics.py` — 5+1 gate execution model. Every time we lose money, a new hard gate gets added to the code. The BTC loss story below is the cleanest example.
 
 ---
 
@@ -84,7 +84,7 @@ python3 firm.py
 python3 firm.py --dry-run --once
 
 # Run a single agent
-python3 firm.py --bot donnie
+python3 firm.py --bot economics
 ```
 
 **firm.py lives at the project root. Agents are in `bots/`.**
@@ -97,27 +97,27 @@ python3 firm.py --bot donnie
 
 | Agent | File | Purpose | Interval |
 |-------|------|---------|---------|
-| Economics | `bots/donnie_v2.py` | Kalshi prediction market execution | 120 min |
-| Congressional | `bots/rugrat.py` | Congressional trade tracker + RAG | 240 min |
+| Economics | `bots/economics.py` | Kalshi prediction market execution | 120 min |
+| Congressional | `bots/congressional.py` | Congressional trade tracker + RAG | 240 min |
 | Weather | `bots/weather.py` | Temperature market scanner (19 cities) | 3 min |
-| Sports | `bots/brad.py` | Sports stink-bid strategy (S1/S2/S3) | 15 min |
-| Options | `bots/jordan.py` | SPY 0DTE price monitor | 15 min |
+| Sports | `bots/sports.py` | Sports stink-bid strategy (S1/S2/S3) | 15 min |
+| Options | `bots/options.py` | SPY 0DTE price monitor | 15 min |
 | System | `bots/supervisor.py` | Health monitor (6 checks) | 30 min |
 
 ```bash
 python3 firm.py --status     # Print scheduler status
 python3 firm.py --dry-run    # Simulate all agents — no orders, no posts
 python3 firm.py --once       # Run all agents once then exit
-python3 firm.py --bot rugrat # Run one agent standalone
+python3 firm.py --bot congressional # Run one agent standalone
 ```
 
 ---
 
 ## Intelligence Layer
 
-### RAG Pipeline (`bots/rugrat.py` + `bots/rag_store.py`)
+### RAG Pipeline (`bots/congressional.py` + `bots/rag_store.py`)
 
-Tracks STOCK Act disclosures from 18 members of Congress. When a high-scoring member trades, Rugrat:
+Tracks STOCK Act disclosures from 18 members of Congress. When a high-scoring member trades, the Congressional agent:
 
 1. Embeds the disclosure query using `all-MiniLM-L6-v2` (local, no API cost)
 2. Runs multi-query retrieval across 206 stored disclosures in ChromaDB
@@ -158,7 +158,7 @@ The BTC loss above scored 3/10 on process. The CPI shelter win scored 9/10. Proc
 
 ---
 
-## Execution Engine (`bots/donnie_v2.py`)
+## Execution Engine (`bots/economics.py`)
 
 **5 + 1 gate model.** Every trade clears all six or doesn't execute:
 

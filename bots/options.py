@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-JORDAN — SPY 0DTE Options Desk
+OPTIONS — SPY 0DTE Options Desk
 Posts to #options-education, #active-plays
 The Firm | Stratton Oakmont Discord Intelligence System
 
@@ -95,14 +95,14 @@ def save_state(state: dict):
         with open(STATE_FILE, 'w') as f:
             json.dump(state, f, indent=2)
     except Exception as e:
-        print(f"[JORDAN] State save error: {e}", file=sys.stderr)
+        print(f"[OPTIONS] State save error: {e}", file=sys.stderr)
 
 
 # ── Discord helper ──────────────────────────────────────────────────────────
 def post_discord(channel_id: int, content: str, token: str = None) -> bool:
     tok = token or JORDAN_TOKEN
     if not tok:
-        print(f"[JORDAN] ERROR: No token", file=sys.stderr)
+        print(f"[OPTIONS] ERROR: No token", file=sys.stderr)
         return False
     url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
     headers = {"Authorization": f"Bot {tok}", "Content-Type": "application/json"}
@@ -112,10 +112,10 @@ def post_discord(channel_id: int, content: str, token: str = None) -> bool:
         try:
             r = requests.post(url, headers=headers, json={"content": chunk}, timeout=10)
             if r.status_code not in (200, 201):
-                print(f"[JORDAN] Discord error {r.status_code}: {r.text[:200]}", file=sys.stderr)
+                print(f"[OPTIONS] Discord error {r.status_code}: {r.text[:200]}", file=sys.stderr)
                 success = False
         except Exception as e:
-            print(f"[JORDAN] Post exception: {e}", file=sys.stderr)
+            print(f"[OPTIONS] Post exception: {e}", file=sys.stderr)
             success = False
     return success
 
@@ -141,7 +141,7 @@ def save_positions(positions: list):
         with open(POSITIONS_FILE, 'w') as f:
             json.dump(positions, f, indent=2)
     except Exception as e:
-        print(f"[JORDAN] Positions save error: {e}", file=sys.stderr)
+        print(f"[OPTIONS] Positions save error: {e}", file=sys.stderr)
 
 
 def add_position(option_type: str, strike: float, entry_price: float,
@@ -188,7 +188,7 @@ def get_spy_price() -> float:
                 if price:
                     return float(price)
     except Exception as e:
-        print(f"[JORDAN] SPY price fetch error: {e}", file=sys.stderr)
+        print(f"[OPTIONS] SPY price fetch error: {e}", file=sys.stderr)
     return 0.0
 
 
@@ -256,7 +256,7 @@ def run_eod_sweep(post: bool = True) -> dict:
     sweep_key = f"eod_sweep_{today}"
 
     if _alert_fired(state, sweep_key):
-        print("[JORDAN] EOD sweep already done today")
+        print("[OPTIONS] EOD sweep already done today")
         return {"skipped": True}
 
     positions = load_positions()
@@ -304,11 +304,11 @@ def run_eod_sweep(post: bool = True) -> dict:
             summary_lines.extend(misses)
         summary_lines.append("\n_All 0DTE positions marked expired. Clean slate tomorrow._")
         summary = "\n".join(summary_lines)
-        print(f"[JORDAN] EOD Summary:\n{summary}")
+        print(f"[OPTIONS] EOD Summary:\n{summary}")
         if post:
             post_discord(CHANNEL_ACTIVE_PLAYS, summary)
     else:
-        print("[JORDAN] EOD sweep: no open 0DTE positions to close")
+        print("[OPTIONS] EOD sweep: no open 0DTE positions to close")
 
     _mark_alert(state, sweep_key)
     save_state(state)
@@ -333,12 +333,12 @@ def run_price_monitor(post: bool = True) -> dict:
         return run_eod_sweep(post=post)
 
     if not is_market_hours():
-        print("[JORDAN] Outside market hours — price monitor skipped")
+        print("[OPTIONS] Outside market hours — price monitor skipped")
         return {"skipped": True, "reason": "outside_market_hours"}
 
     spy_price = get_spy_price()
     if not spy_price:
-        print("[JORDAN] Could not fetch SPY price", file=sys.stderr)
+        print("[OPTIONS] Could not fetch SPY price", file=sys.stderr)
         return {"error": "price_fetch_failed"}
 
     state     = load_state()
@@ -361,7 +361,7 @@ def run_price_monitor(post: bool = True) -> dict:
             f"**Open Positions:**\n{pos_summary}\n\n"
             f"_0DTE — theta burns all day. Stay sharp._"
         )
-        print(f"[JORDAN] Morning brief:\n{brief}")
+        print(f"[OPTIONS] Morning brief:\n{brief}")
         if post:
             post_discord(CHANNEL_OPTIONS_EDUCATION, brief)
         _mark_alert(state, morning_key)
@@ -510,7 +510,7 @@ def run_price_monitor(post: bool = True) -> dict:
         "hits": len(hits),
         "approaching": len(approaching),
     }
-    print(f"[JORDAN] Price monitor: {result}")
+    print(f"[OPTIONS] Price monitor: {result}")
     _write_status('jordan', {
         'mode': 'price_monitor',
         'spy_price': spy_price,
@@ -530,7 +530,7 @@ def run_position_check(post: bool = True) -> str:
     spy_price = get_spy_price()
     now_str   = now_et().strftime('%Y-%m-%d %H:%M ET')
 
-    lines = [f"**📊 JORDAN — SPY 0DTE DESK** | {now_str}\n"]
+    lines = [f"**📊 OPTIONS — SPY 0DTE DESK** | {now_str}\n"]
 
     if not open_pos:
         lines.append("No open positions. Add with `--add CALL|PUT STRIKE ENTRY`")
@@ -586,7 +586,7 @@ def analyze_discord_alert(alert_type: str, price_target: float) -> str:
     time_left    = time_to_close_str()
 
     lines = [
-        f"**🎯 JORDAN — SPY 0DTE Alert Analysis**",
+        f"**🎯 OPTIONS — SPY 0DTE Alert Analysis**",
         f"Alert: SPY **{alert_type}** target **${price_target:.2f}**",
         f"SPY now: **${spy_price:.2f}** | Move needed: {direction} **${abs(move_needed):.2f}** ({move_pct:.1f}%)",
         f"⏱ {time_left}",
@@ -667,7 +667,7 @@ def main():
     if args.monitor:
         result = run_price_monitor(post=post)
         if args.no_post:
-            print(f"[JORDAN] Monitor result: {result}")
+            print(f"[OPTIONS] Monitor result: {result}")
 
     elif args.add:
         opt_type, strike, entry = args.add
@@ -676,14 +676,14 @@ def main():
             target_price=args.target,
             source=args.source,
         )
-        print(f"[JORDAN] Position added: {pos['id']}")
+        print(f"[OPTIONS] Position added: {pos['id']}")
         if args.target:
-            print(f"[JORDAN] Target price: ${args.target:.2f}")
+            print(f"[OPTIONS] Target price: ${args.target:.2f}")
         spy_price = get_spy_price()
         if spy_price and args.target:
             move = abs(float(args.target) - spy_price)
             pct  = move / spy_price * 100
-            print(f"[JORDAN] SPY: ${spy_price:.2f} | Move needed: ${move:.2f} ({pct:.1f}%) | {time_to_close_str()}")
+            print(f"[OPTIONS] SPY: ${spy_price:.2f} | Move needed: ${move:.2f} ({pct:.1f}%) | {time_to_close_str()}")
 
     elif args.position:
         report = run_position_check(post=post)
@@ -700,7 +700,7 @@ def main():
 
     elif args.eod:
         result = run_eod_sweep(post=post)
-        print(f"[JORDAN] EOD sweep: {result}")
+        print(f"[OPTIONS] EOD sweep: {result}")
 
     else:
         parser.print_help()

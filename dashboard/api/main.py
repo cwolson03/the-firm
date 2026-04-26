@@ -67,7 +67,7 @@ def _get_donnie():
     if _donnie_module is None:
         try:
             import importlib.util as _ilu
-            _spec = _ilu.spec_from_file_location("donnie", str(Path("/home/cody/stratton/bots/donnie_v2.py")))
+            _spec = _ilu.spec_from_file_location("economics", str(Path("/home/cody/stratton/bots/economics.py")))
             _donnie_module = _ilu.module_from_spec(_spec)
             _spec.loader.exec_module(_donnie_module)
             log.info("Donnie module cached")
@@ -159,15 +159,27 @@ async def status():
     try:
         log_agent_map = {
             "weather-bot": "weather",
-            "donnie": "donnie",
-            "DONNIE": "donnie",
-            "DONNIE V2": "donnie",
-            "brad": "brad",
-            "BRAD": "brad",
-            "rugrat": "rugrat",
-            "RUGRAT": "rugrat",
-            "jordan": "jordan",
-            "JORDAN": "jordan",
+            "economics": "economics",
+            "ECONOMICS": "economics",
+            "donnie": "economics",
+            "DONNIE": "economics",
+            "DONNIE V2": "economics",
+            "sports": "sports",
+            "SPORTS": "sports",
+            "brad": "sports",
+            "BRAD": "sports",
+            "congressional": "congressional",
+            "CONGRESSIONAL": "congressional",
+            "rugrat": "congressional",
+            "RUGRAT": "congressional",
+            "options": "options",
+            "OPTIONS": "options",
+            "jordan": "options",
+            "JORDAN": "options",
+            "crypto": "crypto",
+            "CRYPTO": "crypto",
+            "weather_intel": "weather_intel",
+            "WEATHER_INTEL": "weather_intel",
             "supervisor": "supervisor",
             "SUPERVISOR": "supervisor",
         }

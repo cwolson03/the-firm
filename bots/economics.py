@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DONNIE V3 — Two-Tier Real-Time Kalshi Scanner
+ECONOMICS — Two-Tier Real-Time Kalshi Scanner
 ===============================================
 Stratton Oakmont prediction market intelligence — next generation.
 
@@ -2794,7 +2794,7 @@ def run_execution_check(plays: list, dry_run: bool = False):
                         )
                         if not _g6_result.get("go", True):  # default True if LLM fails
                             _g6_reason = _g6_result.get('reasoning', 'no reason')[:100]
-                            log.info(f"[DONNIE] LLM gate BLOCKED {_g6_ticker}: {_g6_reason}")
+                            log.info(f"[ECONOMICS] LLM gate BLOCKED {_g6_ticker}: {_g6_reason}")
                             post_discord(
                                 "\U0001f9e0 LLM BLOCK: " + _g6_ticker + " | " + _g6_result.get('reasoning', '')[:200],
                                 channel_id=DISCORD_CH_RESULTS,
@@ -2803,9 +2803,9 @@ def run_execution_check(plays: list, dry_run: bool = False):
                             continue  # skip this candidate — LLM said no
                         _g6_conf = _g6_result.get('confidence', 'unknown')
                         _g6_rsn  = _g6_result.get('reasoning', '')[:80]
-                        log.info(f"[DONNIE] LLM gate PASSED {_g6_ticker}: confidence={_g6_conf} | {_g6_rsn}")
+                        log.info(f"[ECONOMICS] LLM gate PASSED {_g6_ticker}: confidence={_g6_conf} | {_g6_rsn}")
                     except Exception as _g6_err:
-                        log.warning(f"[DONNIE] LLM gate error (trade proceeds): {_g6_err}")
+                        log.warning(f"[ECONOMICS] LLM gate error (trade proceeds): {_g6_err}")
                         # LLM failure = never block the trade (graceful degradation)
 
                 log.info(f"[EXEC] ✅ Executing {signal['ticker']}{' (DRY RUN)' if dry_run else ''}")
@@ -4065,7 +4065,7 @@ def run_scan(post=None, **kwargs):
         import sys as _sys, os as _os
         _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
         from shared_context import write_agent_status
-        write_agent_status('donnie', {'status': 'ran', 'markets_scanned': 0})
+        write_agent_status("economics", {'status': 'ran', 'markets_scanned': 0})
     except Exception:
         pass
 

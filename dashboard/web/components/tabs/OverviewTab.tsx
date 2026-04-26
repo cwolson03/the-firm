@@ -7,22 +7,23 @@ import LoadingSpinner from '@/components/shared/LoadingSpinner'
 import ErrorState from '@/components/shared/ErrorState'
 
 const AGENT_META: Record<string, { icon: string; name: string; interval: string }> = {
-  donnie: { icon: '⚡', name: 'Economics', interval: 'Every 2h' },
+  economics: { icon: '⚡', name: 'Economics', interval: 'Every 2h' },
   weather: { icon: '🌤️', name: 'Weather', interval: 'Every 3m' },
-  brad: { icon: '🏈', name: 'Sports', interval: 'Every 15m' },
-  rugrat: { icon: '🏛️', name: 'Intelligence', interval: 'Every 4h' },
-  jordan: { icon: '📈', name: 'Portfolio', interval: 'Every 15m' },
+  sports: { icon: '🏈', name: 'Sports', interval: 'Every 15m' },
+  congressional: { icon: '🏛️', name: 'Intelligence', interval: 'Every 4h' },
+  options: { icon: '📈', name: 'Portfolio', interval: 'Every 15m' },
   supervisor: { icon: '🔧', name: 'System', interval: 'Every 30m' },
 }
 
 const AGENT_COLORS: Record<string, string> = {
-  donnie: '#00ff88',
+  economics: '#00ff88',
   weather: '#38bdf8',
-  brad: '#f59e0b',
-  rugrat: '#a78bfa',
-  jordan: '#fb923c',
+  sports: '#f59e0b',
+  congressional: '#a78bfa',
+  options: '#fb923c',
   supervisor: '#888',
-  mark_hanna: '#ec4899',
+  weather_intel: '#ec4899',
+  crypto: '#8b5cf6',
 }
 
 const UPCOMING_EVENTS = [
@@ -40,12 +41,12 @@ function timeAgo(ts: number): string {
 }
 
 const AGENT_MAX_AGE: Record<string, number> = {
-  donnie: 10800,    // 3h (runs every 2h)
-  weather: 600,     // 10m (runs every 3m)
-  brad: 2700,       // 45m (runs every 15m)
-  rugrat: 18000,    // 5h (runs every 4h)
-  jordan: 2700,     // 45m (runs every 15m)
-  supervisor: 3600, // 1h (runs every 30m)
+  economics: 10800,    // 3h (runs every 2h)
+  weather: 600,        // 10m (runs every 3m)
+  sports: 2700,        // 45m (runs every 15m)
+  congressional: 18000, // 5h (runs every 4h)
+  options: 2700,       // 45m (runs every 15m)
+  supervisor: 3600,    // 1h (runs every 30m)
 }
 
 function statusColor(ts: number, key?: string): string {
@@ -98,11 +99,11 @@ export default function OverviewTab() {
       const agents = s.agents || {}
       const now = Date.now() / 1000
       const getTs = (a: any) => a?.last_run_ts || (a?.last_run ? new Date(a.last_run).getTime() / 1000 : 0)
-      if (getTs(agents.donnie) && (now - getTs(agents.donnie) < 10800)) online++
+      if (getTs(agents.economics) && (now - getTs(agents.economics) < 10800)) online++
       if (getTs(agents.weather) && (now - getTs(agents.weather) < 600)) online++    // 10m — runs every 3m
-      if (getTs(agents.brad) && (now - getTs(agents.brad) < 2700)) online++          // 45m — runs every 15m
-      if (getTs(agents.rugrat) && (now - getTs(agents.rugrat) < 18000)) online++     // 5h — runs every 4h
-      if (getTs(agents.jordan) && (now - getTs(agents.jordan) < 2700)) online++      // 45m — runs every 15m
+      if (getTs(agents.sports) && (now - getTs(agents.sports) < 2700)) online++          // 45m — runs every 15m
+      if (getTs(agents.congressional) && (now - getTs(agents.congressional) < 18000)) online++     // 5h — runs every 4h
+      if (getTs(agents.options) && (now - getTs(agents.options) < 2700)) online++      // 45m — runs every 15m
       if (getTs(agents.supervisor) && (now - getTs(agents.supervisor) < 3600)) online++ // 1h — runs every 30m
       setSystemsOnline(online)
       setError(false)

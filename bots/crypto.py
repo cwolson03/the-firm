@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CHESTER — Crypto Whale Tracker
+CRYPTO — Crypto Whale Tracker
 Posts to #crypto-stack, #whale-watch
 The Firm | Stratton Oakmont Discord Intelligence System
 """
@@ -46,7 +46,7 @@ KNOWN_EXCHANGES = {
 def post_discord(channel_id: int, content: str, token: str = None) -> bool:
     tok = token or CHESTER_TOKEN
     if not tok:
-        print(f"[CHESTER] ERROR: No token", file=sys.stderr)
+        print(f"[CRYPTO] ERROR: No token", file=sys.stderr)
         return False
     url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
     headers = {
@@ -59,10 +59,10 @@ def post_discord(channel_id: int, content: str, token: str = None) -> bool:
         try:
             r = requests.post(url, headers=headers, json={"content": chunk}, timeout=10)
             if r.status_code not in (200, 201):
-                print(f"[CHESTER] Discord error {r.status_code}: {r.text[:200]}", file=sys.stderr)
+                print(f"[CRYPTO] Discord error {r.status_code}: {r.text[:200]}", file=sys.stderr)
                 success = False
         except Exception as e:
-            print(f"[CHESTER] Discord post exception: {e}", file=sys.stderr)
+            print(f"[CRYPTO] Discord post exception: {e}", file=sys.stderr)
             success = False
     return success
 
@@ -82,7 +82,7 @@ def fetch_whale_alert_rss() -> list:
                 'link': entry.get('link', ''),
             })
     except Exception as e:
-        print(f"[CHESTER] Whale Alert RSS error: {e}", file=sys.stderr)
+        print(f"[CRYPTO] Whale Alert RSS error: {e}", file=sys.stderr)
     return results
 
 
@@ -115,7 +115,7 @@ def fetch_eth_large_transfers(min_eth: int = 100) -> list:
             }
             # Skip genesis — instead use a different approach via mempool
     except Exception as e:
-        print(f"[CHESTER] Etherscan error: {e}", file=sys.stderr)
+        print(f"[CRYPTO] Etherscan error: {e}", file=sys.stderr)
 
     # Use public Ethereum data via beaconchain or similar
     try:
@@ -129,7 +129,7 @@ def fetch_eth_large_transfers(min_eth: int = 100) -> list:
             if eth_price:
                 results.append({'_eth_price': eth_price})
     except Exception as e:
-        print(f"[CHESTER] ETH price fetch error: {e}", file=sys.stderr)
+        print(f"[CRYPTO] ETH price fetch error: {e}", file=sys.stderr)
 
     return results
 
@@ -154,7 +154,7 @@ def fetch_btc_large_txs(min_btc: float = 10.0) -> list:
                         'timestamp': tx.get('time', 0),
                     })
     except Exception as e:
-        print(f"[CHESTER] mempool.space error: {e}", file=sys.stderr)
+        print(f"[CRYPTO] mempool.space error: {e}", file=sys.stderr)
 
     # Also check confirmed blocks
     try:
@@ -171,7 +171,7 @@ def fetch_btc_large_txs(min_btc: float = 10.0) -> list:
                     'timestamp': latest.get('timestamp', 0),
                 })
     except Exception as e:
-        print(f"[CHESTER] mempool block error: {e}", file=sys.stderr)
+        print(f"[CRYPTO] mempool block error: {e}", file=sys.stderr)
 
     return results
 
@@ -192,7 +192,7 @@ def fetch_crypto_prices() -> dict:
                 'eth_change': data.get('ethereum', {}).get('usd_24h_change', 0),
             }
     except Exception as e:
-        print(f"[CHESTER] Price fetch error: {e}", file=sys.stderr)
+        print(f"[CRYPTO] Price fetch error: {e}", file=sys.stderr)
     return {}
 
 
@@ -260,7 +260,7 @@ def build_whale_report(whale_alerts: list, btc_txs: list, prices: dict) -> str:
 
 # ── Run modes ───────────────────────────────────────────────────────────────
 def run_scan(post: bool = True) -> str:
-    print("[CHESTER] Running full crypto whale scan...")
+    print("[CRYPTO] Running full crypto whale scan...")
     whale_alerts = fetch_whale_alert_rss()
     btc_txs      = fetch_btc_large_txs()
     prices       = fetch_crypto_prices()
@@ -277,7 +277,7 @@ def run_scan(post: bool = True) -> str:
 
 
 def run_whale_only(post: bool = True) -> str:
-    print("[CHESTER] Scanning for large transactions only...")
+    print("[CRYPTO] Scanning for large transactions only...")
     btc_txs = fetch_btc_large_txs(min_btc=50)  # Higher threshold for whale-only
     whale_alerts = fetch_whale_alert_rss()
     prices  = fetch_crypto_prices()
@@ -288,7 +288,7 @@ def run_whale_only(post: bool = True) -> str:
 
 
 def run_demo() -> str:
-    print("[CHESTER] Demo mode...")
+    print("[CRYPTO] Demo mode...")
     prices = {'btc_price': 84500, 'btc_change': -2.3, 'eth_price': 1987, 'eth_change': -3.1}
     whale_alerts = [
         {'title': '🚨 2,500 #BTC (211,250,000 USD) transferred from unknown wallet to Binance', 'published': 'Today'},

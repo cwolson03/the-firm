@@ -68,12 +68,12 @@ CHANNELS = {
 
 # ── Scanner schedule (minutes between runs) ─────────────────────────────────
 SCHEDULE = {
-    'kalshi':    120,   # Donnie V2: every 2 hours
-    'sports':    15,    # Brad: every 15 min (matches stink bid refresh cadence)
-    'congress':  240,      # Rugrat: every 4 hours
-    'whale':     999999,   # Chester: every 30 min
-    'options':   15,       # Jordan: price target monitor every 15 min
-    'research':  999999, # Mark Hanna: weekly (7 days in minutes)
+    'kalshi':    120,   # Economics: every 2 hours
+    'sports':    15,    # Sports: every 15 min (matches stink bid refresh cadence)
+    'congress':  240,      # Congressional: every 4 hours
+    'whale':     999999,   # Crypto: every 30 min
+    'options':   15,       # Options: price target monitor every 15 min
+    'research':  999999, # Weather Intel: weekly (7 days in minutes)
     'weather':   3,      # Weather bot: every 3 minutes
     'supervisor': 30,   # Supervisor heartbeat: every 30 min
     'eval': 10080,      # Eval Framework: weekly (7 days in minutes)
@@ -83,7 +83,7 @@ SCHEDULE = {
 _last_run = {k: 0 for k in SCHEDULE}
 _running  = True
 
-# Jordan full position-check cadence (separate from fast price-monitor loop)
+# Options full position-check cadence (separate from fast price-monitor loop)
 _last_full_check = 0   # unix timestamp of last run_position_check() call
 
 # ── Discord post helper ─────────────────────────────────────────────────────
@@ -143,14 +143,14 @@ def reload_module(name: str, path: str):
 
 # ── Scanner runners ──────────────────────────────────────────────────────────
 def run_kalshi_scanner():
-    log.info("[DONNIE V2] Running Kalshi scan...")
+    log.info("[ECONOMICS] Running Kalshi scan...")
     try:
-        donnie_path = os.path.join(BOT_DIR, 'donnie_v2.py')
-        mod = load_module('donnie_v2', donnie_path)
+        donnie_path = os.path.join(BOT_DIR, 'economics.py')
+        mod = load_module("economics", donnie_path)
         if mod and hasattr(mod, 'run_scan'):
             mod.run_scan(post=True)
         else:
-            log.warning("[DONNIE V2] donnie_v2.py has no run_scan() function")
+            log.warning("[ECONOMICS] economics.py has no run_scan() function")
     except Exception as e:
         err = f"❌ **DONNIE V2 (Kalshi) FAILED**: {e}"
         log.error(err)
@@ -158,14 +158,14 @@ def run_kalshi_scanner():
 
 
 def run_sports_scanner():
-    log.info("[BRAD] Running sports scan...")
+    log.info("[SPORTS] Running sports scan...")
     try:
-        sports_path = os.path.join(BOT_DIR, 'brad.py')
-        mod = load_module('sports_scanner', sports_path)
+        sports_path = os.path.join(BOT_DIR, 'sports.py')
+        mod = load_module("sports", sports_path)
         if mod and hasattr(mod, 'run_scan'):
             mod.run_scan(post=True)
         else:
-            log.warning("[BRAD] sports-scanner.py has no run_scan() function")
+            log.warning("[SPORTS] sports-scanner.py has no run_scan() function")
     except Exception as e:
         err = f"❌ **BRAD (Sports) FAILED**: {e}"
         log.error(err)
@@ -187,36 +187,36 @@ def run_weather_scanner():
 
 
 def run_congress_scanner():
-    log.info("[RUGRAT] Running congressional scan...")
+    log.info("[CONGRESSIONAL] Running congressional scan...")
     try:
         sys.path.insert(0, BOT_DIR)
-        import rugrat
-        importlib.reload(rugrat)
-        rugrat.run_recent(post=False)  # SILENT MODE
+        import congressional
+        importlib.reload(congressional)
+        congressional.run_recent(post=False)  # SILENT MODE
     except Exception as e:
         err = f"❌ **RUGRAT (Congress) FAILED**: {e}"
         log.error(err)
         log_to_discord(err)
 
-    # RAG incremental update after each Rugrat run
+    # RAG incremental update after each Congressional run
     try:
         import subprocess
         subprocess.Popen(
             ['python3', os.path.join(BOT_DIR, 'rag_ingest.py'), '--update'],
             cwd=os.path.dirname(BOT_DIR)
         )
-        log.info('[RUGRAT] RAG incremental update triggered')
+        log.info('[CONGRESSIONAL] RAG incremental update triggered')
     except Exception as e:
-        log.warning(f'[RUGRAT] RAG update trigger failed: {e}')
+        log.warning(f'[CONGRESSIONAL] RAG update trigger failed: {e}')
 
 
 def run_whale_scanner():
-    log.info("[CHESTER] Running crypto whale scan...")
+    log.info("[CRYPTO] Running crypto whale scan...")
     try:
         sys.path.insert(0, BOT_DIR)
-        import chester
-        importlib.reload(chester)
-        chester.run_scan(post=False)  # SILENT MODE
+        import crypto
+        importlib.reload(crypto)
+        crypto.run_scan(post=False)  # SILENT MODE
     except Exception as e:
         err = f"❌ **CHESTER (Whale) FAILED**: {e}"
         log.error(err)
@@ -225,20 +225,20 @@ def run_whale_scanner():
 
 def run_options_check():
     global _last_full_check
-    log.info("[JORDAN] Running options price monitor...")
+    log.info("[OPTIONS] Running options price monitor...")
     try:
         sys.path.insert(0, BOT_DIR)
-        import jordan
-        importlib.reload(jordan)
+        import options
+        importlib.reload(options)
 
         # PRIMARY: price monitor every 15 min (market hours only)
-        jordan.run_price_monitor(post=True)
+        options.run_price_monitor(post=True)
 
         # SECONDARY: full position check every 60 min
         now_ts = time.time()
         if now_ts - _last_full_check >= 3600:
-            log.info("[JORDAN] Running full position check (60-min cadence)...")
-            jordan.run_position_check(post=True)
+            log.info("[OPTIONS] Running full position check (60-min cadence)...")
+            options.run_position_check(post=True)
             _last_full_check = now_ts
 
     except Exception as e:
@@ -248,12 +248,12 @@ def run_options_check():
 
 
 def run_weekly_research():
-    log.info("[MARK HANNA] Running weekly deep dive...")
+    log.info("[WEATHER_INTEL] Running weekly deep dive...")
     try:
         sys.path.insert(0, BOT_DIR)
-        import mark_hanna
-        importlib.reload(mark_hanna)
-        mark_hanna.run_weekly(post=False)  # SILENT MODE
+        import weather_intel
+        importlib.reload(weather_intel)
+        weather_intel.run_weekly(post=False)  # SILENT MODE
     except Exception as e:
         err = f"❌ **MARK HANNA (Research) FAILED**: {e}"
         log.error(err)
@@ -318,12 +318,12 @@ def get_status() -> str:
         f"*{now.strftime('%Y-%m-%d %H:%M UTC')}*",
         "",
         "**Bots:**",
-        "  🎰 Donnie — Kalshi/Polymarket scanner",
-        "  🏛️ Rugrat — Congressional & insider tracker",
-        "  🐋 Chester — Crypto whale tracker",
-        "  📈 Jordan — Options coach & position monitor",
-        "  🏈 Brad — Sports betting & promo tracker",
-        "  🎩 Mark Hanna — Unconventional alpha research",
+        "  🎰 Economics — Kalshi/Polymarket scanner",
+        "  🏛️ Congressional — Congressional & insider tracker",
+        "  🐋 Crypto — Crypto whale tracker",
+        "  📈 Options — Options coach & position monitor",
+        "  🏈 Sports — Sports betting & promo tracker",
+        "  🎩 Weather Intel — Weather market alpha research",
         "",
         "**Scanner Status:**",
     ]
@@ -365,22 +365,22 @@ def handle_command(command: str, args: list = None) -> str:
 
     elif command == 'promos':
         run_sports_scanner()
-        return "✅ Brad is scanning promos..."
+        return "✅ Sports is scanning promos..."
 
     elif command == 'research' and args and args[0].lower() == 'weekly':
         threading.Thread(target=run_weekly_research, daemon=True).start()
-        return "✅ Mark Hanna is deep-diving..."
+        return "✅ Weather Intel is analyzing..."
 
     elif command == 'research' and args and args[0].lower() == 'challenge':
         if len(args) > 1:
             ticker = args[1].upper()
             try:
                 sys.path.insert(0, BOT_DIR)
-                import mark_hanna
-                importlib.reload(mark_hanna)
-                return mark_hanna.run_challenge(ticker, post=True)
+                import weather_intel
+                importlib.reload(weather_intel)
+                return weather_intel.run_challenge(ticker, post=True)
             except Exception as e:
-                return f"❌ Mark Hanna error: {e}"
+                return f"❌ Weather Intel error: {e}"
         return "❌ Usage: /research challenge TICKER"
 
     return f"❌ Unknown command: {command}"
@@ -440,12 +440,12 @@ def announce_startup():
         f"🏦 **THE FIRM IS OPERATIONAL** — {now}\n\n"
         f"All bots are live. Intelligence is flowing.\n\n"
         f"**The Roster:**\n"
-        f"🎰 **Donnie V2** — Kalshi scanner + arb + weather markets + regime detector. Every 2 hours.\n"
-        f"🏛️ **Rugrat** — Congressional trades, Senate Stock Watcher, SEC Form 4 filings. Every 4 hours.\n"
-        f"🐋 **Chester** — Crypto whale tracker. BTC mempool + Whale Alert RSS. Every 30 min.\n"
-        f"📈 **Jordan** — Options position monitor & Discord alert analyzer. Every hour.\n"
-        f"🏈 **Brad** — Sports betting lines, promo tracker. Every 2 hours.\n"
-        f"🎩 **Mark Hanna** — Weekly unconventional alpha deep-dives. Devil's advocate mode available.\n\n"
+        f"🎰 **Economics** — Kalshi scanner + arb + weather markets + regime detector. Every 2 hours.\n"
+        f"🏛️ **Congressional** — Congressional trades, Senate Stock Watcher, SEC Form 4 filings. Every 4 hours.\n"
+        f"🐋 **Crypto** — Crypto whale tracker. BTC mempool + Whale Alert RSS. Every 30 min.\n"
+        f"📈 **Options** — Options position monitor & Discord alert analyzer. Every hour.\n"
+        f"🏈 **Sports** — Sports betting lines, promo tracker. Every 2 hours.\n"
+        f"🎩 **Weather Intel** — Weekly unconventional alpha deep-dives. Devil's advocate mode available.\n\n"
         f"**Commands:** `/status` | `/scan [kalshi|sports|congress|whale]` | `/promos` | `/research weekly`\n\n"
         f"_We don't slow down. We don't look back. We find the money._\n"
         f"— Stratton"
@@ -489,12 +489,12 @@ def main():
 
     if args.bot:
         bot_map = {
-            'donnie': ('kalshi', 'Donnie — Kalshi scanner'),
-            'rugrat': ('congress', 'Rugrat — Congressional tracker'),
-            'chester': ('whale', 'Chester — Crypto whale tracker'),
-            'jordan': ('options', 'Jordan — Options coach'),
-            'brad': ('sports', 'Brad — Sports & promo scanner'),
-            'mark': ('research', 'Mark Hanna — Research'),
+            'donnie': ('kalshi', 'Economics — Kalshi scanner'),
+            'rugrat': ('congress', 'Congressional — Congressional tracker'),
+            'chester': ('whale', 'Crypto — Crypto whale tracker'),
+            'jordan': ('options', 'Options — Options coach'),
+            'brad': ('sports', 'Sports — Sports & promo scanner'),
+            'mark': ('research', 'Weather Intel — Research'),
         }
         key = args.bot.lower()
         if key in bot_map:

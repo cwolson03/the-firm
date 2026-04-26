@@ -23,7 +23,7 @@ Each entry answers: what happened, what we changed, why.
 1. Insufficient time-to-close buffer — 9 minutes is too short for a crypto range market with high volatility
 2. Spot too close to threshold — 0.05% buffer means any normal volatility prints across the line
 
-**Decision:** Added two mandatory hard gates to `donnie_v2.py`:
+**Decision:** Added two mandatory hard gates to `economics.py`:
 ```python
 CRYPTO_MIN_MINUTES_TO_CLOSE = 30   # no crypto/commodity entry inside 30 min
 CRYPTO_MIN_BUFFER_PCT = 0.005       # spot must be ≥0.5% from threshold
@@ -64,7 +64,7 @@ These aren't suggestions — they're execution blockers. The quant model can sho
 
 ## 2026-04-21 — Directional edge gate: the payout vs. model edge distinction
 
-**Comment preserved in donnie_v2.py:**
+**Comment preserved in economics.py:**
 ```
 # ── FIX (Apr 21): Use directional model edge, not payout edge ─────────────
 # Payout edge ((1-price) or price) can be positive even when the model says

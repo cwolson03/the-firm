@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-RUGRAT — Congressional Trade Intelligence System
+CONGRESSIONAL — Congressional Trade Intelligence System
 Track 18 members. Score their trades. Cross-reference Cody's book. Post actionable alerts.
 The Firm | Stratton Oakmont Discord Intelligence System
 """
@@ -172,7 +172,7 @@ def post_discord(channel_id: int, content: str, demo: bool = False) -> bool:
         return True
 
     if not RUGRAT_TOKEN:
-        print("[RUGRAT] ERROR: RUGRAT_TOKEN not loaded", file=sys.stderr)
+        print("[CONGRESSIONAL] ERROR: RUGRAT_TOKEN not loaded", file=sys.stderr)
         return False
 
     url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
@@ -187,17 +187,17 @@ def post_discord(channel_id: int, content: str, demo: bool = False) -> bool:
         try:
             r = requests.post(url, headers=headers, json={"content": chunk}, timeout=10)
             if r.status_code not in (200, 201):
-                print(f"[RUGRAT] Discord error {r.status_code}: {r.text[:300]}", file=sys.stderr)
+                print(f"[CONGRESSIONAL] Discord error {r.status_code}: {r.text[:300]}", file=sys.stderr)
                 success = False
         except Exception as e:
-            print(f"[RUGRAT] Discord exception: {e}", file=sys.stderr)
+            print(f"[CONGRESSIONAL] Discord exception: {e}", file=sys.stderr)
             success = False
     return success
 
 
 # ── Data Fetchers ────────────────────────────────────────────────────────────
 def fetch_senate_trades() -> list:
-    print("[RUGRAT] Fetching Senate trades...")
+    print("[CONGRESSIONAL] Fetching Senate trades...")
     # Try multiple sources in order of reliability
     sources = [
         ('s3-west', 'https://senate-stock-watcher-data.s3.us-west-2.amazonaws.com/aggregate/all_transactions.json'),
@@ -216,18 +216,18 @@ def fetch_senate_trades() -> list:
                         tx['_name']    = name
                         tx['_chamber'] = 'Senate'
                         trades.append(tx)
-                print(f"[RUGRAT] Fetched {len(trades)} Senate transactions (source: {label})")
+                print(f"[CONGRESSIONAL] Fetched {len(trades)} Senate transactions (source: {label})")
                 return trades
             else:
-                print(f"[RUGRAT] Senate source {label} returned {r.status_code}", file=sys.stderr)
+                print(f"[CONGRESSIONAL] Senate source {label} returned {r.status_code}", file=sys.stderr)
         except Exception as e:
-            print(f"[RUGRAT] Senate source {label} error: {e}", file=sys.stderr)
-    print("[RUGRAT] WARNING: All Senate sources failed — returning empty list", file=sys.stderr)
+            print(f"[CONGRESSIONAL] Senate source {label} error: {e}", file=sys.stderr)
+    print("[CONGRESSIONAL] WARNING: All Senate sources failed — returning empty list", file=sys.stderr)
     return []
 
 
 def fetch_house_trades() -> list:
-    print("[RUGRAT] Fetching House trades...")
+    print("[CONGRESSIONAL] Fetching House trades...")
     sources = [
         ('s3-west', 'https://house-stock-watcher-data.s3.us-west-2.amazonaws.com/data/all_transactions.json'),
         ('s3-east', HOUSE_URL),
@@ -243,13 +243,13 @@ def fetch_house_trades() -> list:
                     tx['_name']    = tx.get('representative', 'Unknown Rep')
                     tx['_chamber'] = 'House'
                     trades.append(tx)
-                print(f"[RUGRAT] Fetched {len(trades)} House transactions (source: {label})")
+                print(f"[CONGRESSIONAL] Fetched {len(trades)} House transactions (source: {label})")
                 return trades
             else:
-                print(f"[RUGRAT] House source {label} returned {r.status_code}", file=sys.stderr)
+                print(f"[CONGRESSIONAL] House source {label} returned {r.status_code}", file=sys.stderr)
         except Exception as e:
-            print(f"[RUGRAT] House source {label} error: {e}", file=sys.stderr)
-    print("[RUGRAT] WARNING: All House sources failed — returning empty list", file=sys.stderr)
+            print(f"[CONGRESSIONAL] House source {label} error: {e}", file=sys.stderr)
+    print("[CONGRESSIONAL] WARNING: All House sources failed — returning empty list", file=sys.stderr)
     return []
 
 
@@ -617,7 +617,7 @@ def fetch_stock_data(ticker: str) -> dict:
             '52w_low':      fifty_two_low,
         }
     except Exception as e:
-        print(f"[RUGRAT] Yahoo Finance error for {ticker}: {e}", file=sys.stderr)
+        print(f"[CONGRESSIONAL] Yahoo Finance error for {ticker}: {e}", file=sys.stderr)
         return {}
 
 
@@ -870,7 +870,7 @@ def process_trades(trades: list, days: int = 7, demo: bool = False, force_new: b
     # Filter to recent
     recent  = filter_recent(watched, days=days)
 
-    print(f"[RUGRAT] {len(recent)} trades from watched members in last {days} days")
+    print(f"[CONGRESSIONAL] {len(recent)} trades from watched members in last {days} days")
 
     # Load seen IDs
     seen = load_seen() if not force_new else set()
@@ -899,7 +899,7 @@ def process_trades(trades: list, days: int = 7, demo: bool = False, force_new: b
             new_seen.add(trade_id)
             continue
 
-        print(f"[RUGRAT] {member_name} | {ticker} | {tx_type} | Score: {scored['total']} | Tier: {tier}")
+        print(f"[CONGRESSIONAL] {member_name} | {ticker} | {tx_type} | Score: {scored['total']} | Tier: {tier}")
 
         # Fetch stock data and news for WATCH and above
         stock_data = {}
@@ -953,10 +953,10 @@ def process_trades(trades: list, days: int = 7, demo: bool = False, force_new: b
 # ── Run Modes ─────────────────────────────────────────────────────────────────
 def run_scan(demo: bool = False):
     """Full 7-day scan of all watched members."""
-    print("[RUGRAT] === FULL SCAN — Last 7 Days ===")
+    print("[CONGRESSIONAL] === FULL SCAN — Last 7 Days ===")
     trades    = fetch_all_trades()
     processed = process_trades(trades, days=7, demo=demo)
-    print(f"[RUGRAT] Scan complete. {len(processed)} new trades processed.")
+    print(f"[CONGRESSIONAL] Scan complete. {len(processed)} new trades processed.")
     if not processed:
         msg = "🏛️ **RUGRAT** — Scan complete. No new trades from watched members in last 7 days."
         post_discord(CHANNEL_SENATOR_TRACKER, msg, demo=demo)
@@ -964,12 +964,12 @@ def run_scan(demo: bool = False):
 
 def run_recent(demo: bool = False, post: bool = True):
     """24-hour scan."""
-    print("[RUGRAT] === RECENT SCAN — Last 24h ===")
+    print("[CONGRESSIONAL] === RECENT SCAN — Last 24h ===")
     trades    = fetch_all_trades()
     processed = process_trades(trades, days=1, demo=demo)
-    print(f"[RUGRAT] Recent scan complete. {len(processed)} new trades processed.")
+    print(f"[CONGRESSIONAL] Recent scan complete. {len(processed)} new trades processed.")
     if not processed:
-        print("[RUGRAT] No new trades from watched members in last 24h.")
+        print("[CONGRESSIONAL] No new trades from watched members in last 24h.")
     _write_status('rugrat', {
         'mode': 'recent_scan',
         'trades_processed': len(processed),
@@ -978,7 +978,7 @@ def run_recent(demo: bool = False, post: bool = True):
 
 def run_member(member_query: str, demo: bool = False):
     """Show all recent trades for a specific member."""
-    print(f"[RUGRAT] === MEMBER SCAN: {member_query} ===")
+    print(f"[CONGRESSIONAL] === MEMBER SCAN: {member_query} ===")
     trades = fetch_all_trades()
 
     # Find matching member key
@@ -989,8 +989,8 @@ def run_member(member_query: str, demo: bool = False):
             break
 
     if not matched_key:
-        print(f"[RUGRAT] No watched member matching '{member_query}'")
-        print(f"[RUGRAT] Watched members: {', '.join(WATCHED_MEMBERS.keys())}")
+        print(f"[CONGRESSIONAL] No watched member matching '{member_query}'")
+        print(f"[CONGRESSIONAL] Watched members: {', '.join(WATCHED_MEMBERS.keys())}")
         return
 
     # Filter to this member
@@ -1003,10 +1003,10 @@ def run_member(member_query: str, demo: bool = False):
 
     # Get last 30 days for member view
     recent = filter_recent(member_trades, days=30)
-    print(f"[RUGRAT] Found {len(recent)} trades for {matched_key} in last 30 days")
+    print(f"[CONGRESSIONAL] Found {len(recent)} trades for {matched_key} in last 30 days")
 
     if not recent:
-        print(f"[RUGRAT] No recent trades found for {matched_key}")
+        print(f"[CONGRESSIONAL] No recent trades found for {matched_key}")
         return
 
     # Sort by date desc
@@ -1050,20 +1050,20 @@ def run_member(member_query: str, demo: bool = False):
 def run_ticker(ticker: str, demo: bool = False):
     """Find all congressional trades in a specific ticker."""
     ticker = ticker.upper()
-    print(f"[RUGRAT] === TICKER SCAN: ${ticker} ===")
+    print(f"[CONGRESSIONAL] === TICKER SCAN: ${ticker} ===")
     trades = fetch_all_trades()
 
     # Filter by ticker
     ticker_trades = [t for t in trades if (t.get('ticker') or '').upper() == ticker]
     recent        = filter_recent(ticker_trades, days=30)
 
-    print(f"[RUGRAT] Found {len(recent)} trades in ${ticker} in last 30 days (all members)")
+    print(f"[CONGRESSIONAL] Found {len(recent)} trades in ${ticker} in last 30 days (all members)")
 
     # Also check watched members specifically
     watched_ticker = [t for t in recent if match_member(t.get('_name', '')) is not None]
 
     lines = [
-        f"🎯 **RUGRAT — Congressional Activity: ${ticker}**",
+        f"🎯 **CONGRESSIONAL — Congressional Activity: ${ticker}**",
         f"Last 30 days: {len(recent)} total trades | {len(watched_ticker)} from watched members",
         "",
     ]
@@ -1099,12 +1099,12 @@ def run_ticker(ticker: str, demo: bool = False):
 
 def run_summary(demo: bool = False):
     """Post weekly summary of top trades to senator-tracker."""
-    print("[RUGRAT] === WEEKLY SUMMARY ===")
+    print("[CONGRESSIONAL] === WEEKLY SUMMARY ===")
     trades  = fetch_all_trades()
     watched = filter_watched(trades)
     recent  = filter_recent(watched, days=7)
 
-    print(f"[RUGRAT] {len(recent)} trades from watched members in last 7 days")
+    print(f"[CONGRESSIONAL] {len(recent)} trades from watched members in last 7 days")
 
     # Score all of them
     scored_trades = []
@@ -1162,8 +1162,8 @@ def run_summary(demo: bool = False):
 
 def run_demo():
     """Demo mode — generate sample output without hitting Discord or external APIs."""
-    print("[RUGRAT] === DEMO MODE — No Discord posts ===")
-    print("[RUGRAT] Generating synthetic trade alerts...\n")
+    print("[CONGRESSIONAL] === DEMO MODE — No Discord posts ===")
+    print("[CONGRESSIONAL] Generating synthetic trade alerts...\n")
 
     sample_trades = [
         {
@@ -1252,13 +1252,13 @@ def run_demo():
             print(f"[DEMO] Tier: {tier} — would batch in daily summary")
 
     print(f"\n{'─'*70}")
-    print("[RUGRAT] Demo complete. Run with --scan to process live data.")
+    print("[CONGRESSIONAL] Demo complete. Run with --scan to process live data.")
 
 
 # ── Entry Point ───────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
-        description='RUGRAT — Congressional Trade Intelligence System',
+        description='CONGRESSIONAL — Congressional Trade Intelligence System',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
