@@ -1,16 +1,14 @@
 # The Firm — Autonomous Trading Intelligence System
 
-**What it is in 60 seconds:** A multi-agent system that reads from public data sources — congressional trade disclosures, weather forecasts, prediction market prices — uses LLMs to reason about whether to act, and places trades within hard risk limits. Live on a Raspberry Pi since April 2026. Every decision is logged, and after every trade resolves, a second LLM independently critiques the process quality (not just the outcome).
+A multi-agent system that reads from public data sources — congressional trade disclosures, weather forecasts, prediction market prices — uses LLMs to reason about whether to act, and places trades within hard risk limits. Runs 24/7 on a Raspberry Pi. Every trade decision is logged, and after every position resolves, a second LLM independently critiques the process quality — not just the outcome.
 
-**The architecture in one sentence:** `firm.py` schedules 8 specialized agents, each with its own domain model, LLM reasoning layer, and write access to a shared state file the dashboard reads from.
+`firm.py` schedules 8 specialized agents, each with its own domain model, LLM reasoning layer, and write access to a shared state file the dashboard reads from.
 
-> **The pitch:** Replace STOCK Act disclosures with any institutional knowledge base — ATS contacts, deal histories, relationship graphs — and the RAG pipeline in `congressional.py` + `rag_store.py` is the same architecture. The retrieval, the LLM reasoning over retrieved context, the structured output — it all transfers.
-
-**The four files that demonstrate the interesting engineering:**
+**The interesting parts:**
 - `bots/rag_store.py` — RAG pipeline over 206 congressional disclosures (ChromaDB + sentence-transformers, multi-query retrieval with reranking)
 - `bots/llm_client.py` — three-model LLM dispatcher (Grok + Claude + GPT-4o) with consensus checking and graceful degradation
-- `bots/eval_framework.py` — post-resolution trade evaluator: scores the *process quality*, not the outcome. A 10/10 process can lose; a 0/10 process can win. They're different things.
-- `bots/economics.py` — 5+1 gate execution model. Every time we lose money, a new hard gate gets added to the code. The BTC loss story below is the cleanest example.
+- `bots/eval_framework.py` — post-resolution trade evaluator: scores process quality, not outcome. A 10/10 process can still lose. They're different things.
+- `bots/economics.py` — 5+1 gate execution model where every real loss adds a new mandatory guardrail to the code
 
 ---
 
