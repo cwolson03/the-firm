@@ -1,14 +1,14 @@
 # The Firm — Autonomous Trading Intelligence System
 
-A multi-agent system that reads from public data sources — congressional trade disclosures, weather forecasts, prediction market prices — uses LLMs to reason about whether to act, and places trades within hard risk limits. Runs 24/7 on a Raspberry Pi. Every trade decision is logged, and after every position resolves, a second LLM independently critiques the process quality — not just the outcome.
+I built this to trade prediction markets algorithmically and actually learn from what works and what doesn't. It runs on a Raspberry Pi 24/7, deploys real money, and has 8 specialized agents handling everything from Kalshi economic data trades to congressional stock disclosure tracking to daily temperature markets.
 
-`firm.py` schedules 8 specialized agents, each with its own domain model, LLM reasoning layer, and write access to a shared state file the dashboard reads from.
+The thing I'm most proud of is the eval framework — after every trade resolves, a second LLM independently reviews the decision process. Not just whether we won or lost, but whether the reasoning was sound. A good process can lose. A bad process can win. Those are different things and tracking the difference is the only way to actually get better.
 
-**The interesting parts:**
-- `bots/rag_store.py` — RAG pipeline over 206 congressional disclosures (ChromaDB + sentence-transformers, multi-query retrieval with reranking)
-- `bots/llm_client.py` — three-model LLM dispatcher (Grok + Claude + GPT-4o) with consensus checking and graceful degradation
-- `bots/eval_framework.py` — post-resolution trade evaluator: scores process quality, not outcome. A 10/10 process can still lose. They're different things.
-- `bots/economics.py` — 5+1 gate execution model where every real loss adds a new mandatory guardrail to the code
+**The parts worth looking at:**
+- `bots/rag_store.py` — RAG over 206 congressional trade disclosures. Multi-query embedding search with reranking, ChromaDB + sentence-transformers running locally on the Pi
+- `bots/llm_client.py` — routes between Grok, Claude, and GPT-4o depending on the task. Has a consensus mode where both models have to agree before a high-stakes trade goes through
+- `bots/eval_framework.py` — the LLM process reviewer mentioned above
+- `bots/economics.py` — the main trading engine. Every real loss we've taken has added a new hard gate to this file. The BTC story below is a good example of how that works
 
 ---
 
@@ -20,8 +20,8 @@ A multi-agent system that reads from public data sources — congressional trade
 > **GDP Q1 2026 — Three concurrent NO positions**
 > GDPNow tracking 1.24% annualized vs thresholds of 1.0%, 1.5%, 2.0%, 2.5%, 3.0%. Positions open at time of writing.
 
-> **BTC intraday loss — April 2026 (the important one)**
-> NO position entered 9 minutes before close with spot 0.05% from threshold. Direction was right. Execution failed: no time buffer, no spot proximity check. This loss directly added two hard gates to the code: `CRYPTO_MIN_MINUTES_TO_CLOSE = 30` and `CRYPTO_MIN_BUFFER_PCT = 0.005`. Both are now mandatory for every crypto/commodity trade. Bad calls get codified into guardrails — not just noted and forgotten.
+> **BTC intraday loss — April 2026**
+> Entered a NO position 9 minutes before close with spot only 0.05% from the threshold. Direction was right but we got caught by normal volatility in the final minutes. Took the loss, figured out exactly what went wrong, and added two hard gates to the code: `CRYPTO_MIN_MINUTES_TO_CLOSE = 30` and `CRYPTO_MIN_BUFFER_PCT = 0.005`. Now every crypto or commodity trade has to clear both before it executes. That's basically how this whole system evolves — lose money, understand why, make it impossible to do the same thing twice.
 
 ---
 
