@@ -1,41 +1,21 @@
 #!/usr/bin/env python3
 """
-ECONOMICS — Two-Tier Real-Time Kalshi Scanner
-===============================================
-Stratton Oakmont prediction market intelligence — next generation.
+economics.py — Kalshi trading engine (Donnie)
 
-NEW IN V3:
-  - Two-tier architecture: Discovery (30min) + Real-time Monitor (30sec)
-  - Weather Signal Layer: Open-Meteo forecasts vs Kalshi weather markets
-  - Polymarket Signal Layer: cross-platform arb detection (read-only)
-  - Odds Velocity Tracker: price/volume acceleration signals
-  - Stink Bid Strategy (importable by Brad — NOT used by Donnie)
-  - Tighter scheduling: 30min discovery, 30sec watchlist pulse
+Two-tier scanner: discovery (30min) + realtime monitor (30sec).
+Scores markets with edge calculators (GDP, CPI, crypto, commodity),
+whale tracking, velocity detection, and order book analysis.
+Executes trades through a 5-gate guardrail system.
 
-KEPT FROM V2:
-  - RSA-PSS auth (unchanged)
-  - All guardrails (35% max, 70% deployed, 15¢ edge, 90-day horizon)
-  - Time horizon penalty scoring
-  - Whale scoring (compute_whale_boost)
-  - Discord report format (format_donnie_report)
-  - Execution engine (execute_trade, post_execution_result)
-  - Path auto-detection (Atlas vs local)
-  - --dry-run and --scan-once flags
-
-API Notes:
-  - Prices are in dollars (0.0–1.0), NOT cents
-  - Volume is volume_fp (float), spread in dollars
-  - Categories live on EVENTS, not markets
-  - Trades endpoint: GET /markets/trades?ticker=X&limit=50
+API notes:
+  - prices in dollars (0.0-1.0), volume is volume_fp
+  - categories on events, not markets
+  - GET /markets/trades?ticker=X&limit=50
 
 Usage:
-    python3 donnie-v3.py                   # continuous mode
-    python3 donnie-v3.py --scan-once       # single full scan + exit
-    python3 donnie-v3.py --dry-run         # stdout only, no Discord
-    python3 donnie-v3.py --dry-run --scan-once
-
-Requirements:
-    pip install requests cryptography scipy
+    python3 economics.py                   # continuous
+    python3 economics.py --scan-once       # single scan + exit
+    python3 economics.py --dry-run         # no Discord, stdout only
 """
 
 import os
@@ -54,19 +34,11 @@ from typing import Optional
 
 import requests
 
-try:
-    from scipy.stats import norm
-    SCIPY_AVAILABLE = True
-except ImportError:
-    SCIPY_AVAILABLE = False
-
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
-# ─────────────────────────────────────────────────────────────────────────────
 # CONFIG
-# ─────────────────────────────────────────────────────────────────────────────
 
 KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 KEY_ID      = "28aebab3-8694-46bc-95f1-2d37d9e9266e"
@@ -85,72 +57,68 @@ else:
 DISCORD_CH_KALSHI  = 1491861941361180924   # #kalshi-signals
 DISCORD_CH_RESULTS = 1491861943894671450   # #kalshi-results
 
-# ── Scanner thresholds ────────────────────────────────────────────────────────
+# --- Scanner thresholds ---
 MIN_VOLUME         = 200
 MAX_SPREAD_DOLLARS = 0.15
 TOP_PER_CAT        = 10
 
-# ── Whale detection ───────────────────────────────────────────────────────────
+# --- Whale detection ---
 WHALE_MIN_CONTRACTS    = 50
 WHALE_MIN_NOTIONAL     = 200
 WHALE_WINDOW_HOURS     = 1
 WHALE_ALERT_THRESHOLD  = 3
 WHALE_FETCH_TOP_N      = 30
 
-# ── Confidence thresholds ─────────────────────────────────────────────────────
+# --- Confidence thresholds ---
 CONFIDENCE_HIGH_THRESHOLD   = 0.65
 CONFIDENCE_MEDIUM_THRESHOLD = 0.35
 
-# ── Report config ─────────────────────────────────────────────────────────────
+# --- Report config ---
 TOP_PLAYS_DISPLAY = 5
 WATCHLIST_SIZE    = 25   # Tier 1 → Tier 2 watchlist
 
-# ── Execution Guardrails (NON-NEGOTIABLE — never bypass) ──────────────────────
+# --- Execution Guardrails (NON-NEGOTIABLE — never bypass) ---
 EXEC_MIN_EDGE_DOLLARS   = 0.18
 EXEC_MAX_PER_POSITION   = 0.35
 EXEC_MAX_TOTAL_DEPLOYED = 0.70
 EXEC_POSITION_SIZE_PCT  = 0.05
 
-# ── Stale order management ───────────────────────────────────────────────────
+# --- Stale order management ---
 ORDER_MAX_AGE_HOURS = 2  # auto-cancel Donnie limit orders older than 2 hours
 
-# ── Crypto/Commodity near-expiry cutoff ──────────────────────────────────────
+# --- Crypto/Commodity near-expiry cutoff ---
 CRYPTO_MIN_MINUTES_TO_CLOSE = 30   # never trade crypto/commodity range markets within 30 min of close
 CRYPTO_MIN_BUFFER_PCT        = 0.005  # spot must be >0.5% away from threshold
 
-# ── Scheduling ────────────────────────────────────────────────────────────────
+# --- Scheduling ---
 DISCOVERY_SCAN_INTERVAL_SEC   = 1800   # 30 min — full market scan
 REALTIME_MONITOR_INTERVAL_SEC = 30     # 30 sec — watchlist price pulse
-WEATHER_REFRESH_INTERVAL_SEC  = 900    # 15 min — weather model refresh
-POLYMARKET_REFRESH_INTERVAL_SEC = 300  # 5 min  — polymarket price sync
-SMART_MONEY_INTERVAL_SEC        = 1800  # 30 min — smart money tracker
 CRYPTO_MONITOR_INTERVAL_SEC     = 300   # 5 min  — crypto price monitor
 
-# Daily economic data release windows (UTC) — Donnie runs more aggressive checks
+# data release windows (UTC) — scan faster during these
 RELEASE_WINDOWS = [
     (8, 25, 8, 45),    # 8:30 ET = 12:30 UTC — NFP, CPI, PPI, retail sales
     (13, 55, 14, 15),  # 2:00 ET = 18:00 UTC — FOMC decisions
     (9, 55, 10, 15),   # 10:00 ET = 14:00 UTC — ISM, housing
 ]
 
-# ── Tier 2 real-time trigger thresholds ──────────────────────────────────────
+# --- Tier 2 real-time trigger thresholds ---
 TIER2_PRICE_MOVE_TRIGGER = 0.05        # 5¢ price move triggers re-score
 TIER2_VOLUME_SPIKE_MULT  = 2.0         # 2x volume spike triggers re-score
 
-# ── Velocity tracker thresholds (cents per minute) ───────────────────────────
+# --- Velocity tracker thresholds (cents per minute) ---
 VEL_MOVING    = 2.0    # log only
 VEL_FAST_MOVE = 5.0    # +0.15 confidence boost
 VEL_SPIKE     = 10.0   # +0.30 confidence boost + immediate exec check
 VEL_VOL_SPIKE = 2.0    # 2x volume acceleration boost multiplier → +0.20
 
-# ── Polymarket arb thresholds ─────────────────────────────────────────────────
-POLY_ARB_MIN_SPREAD    = 0.10   # 10¢ — only fire on clear arb
+# --- Polymarket arb thresholds ---
 
-# ── Market taker mode ─────────────────────────────────────────────────────────
+# --- Market taker mode ---
 MARKET_TAKER_THRESHOLD   = 0.80  # use market order (ask price) above this confidence
 MARKET_TAKER_CATEGORIES  = set()  # WEATHER moved to weather.py; ECONOMIC_DATA re-enable when verified
 
-# ── Thesis direction lock — Donnie CANNOT trade opposite to these ─────────────
+# --- Thesis direction lock — Donnie CANNOT trade opposite to these ---
 THESIS_DIRECTION_LOCK = {
     "KXGDP-26APR30-T1.0": "YES",   # GDPNow 1.31% > 1.0% threshold — YES wins
     "KXGDP-26APR30-T2.0": "NO",    # GDPNow 1.31% < 2.0% — NO wins
@@ -180,11 +148,6 @@ def _get_active_thesis_locks() -> dict:
         active[ticker] = lock_data
     return active
 
-POLY_FETCH_LIMIT       = 200
-POLY_MATCH_MIN_WORDS   = 2   # lowered from 3 — catches more valid matches
-
-POLYMARKET_ENABLED = False  # Set True when Polymarket integration is ready
-
 # Stop-loss config for open positions
 STOP_LOSS_RULES = {
     "KXGDP-26APR30-T2.0": {"direction": "NO", "stop_if_no_below": 0.55},   # stop if NO price drops below 55¢
@@ -192,7 +155,7 @@ STOP_LOSS_RULES = {
     "KXGDP-26APR30-T3.0": {"direction": "NO", "stop_if_no_below": 0.75},
 }
 
-# ── Market category tiers — determines scoring multiplier ─────────────────────
+# --- Market category tiers — determines scoring multiplier ---
 # Tier 1: Donnie has quantifiable data edge
 # Tier 2: Some signal available
 # Tier 3: No edge — exclude or require strong whale signal
@@ -207,7 +170,7 @@ CATEGORY_TIERS = {
     "JUNK":           0.0,   # Exclude: "will X say Y", "will X leave office"
 }
 
-# ── Economic calendar — update periodically ───────────────────────────────────
+# --- Economic calendar — update periodically ---
 # Format: (date_str, event_name, series_ticker_prefix)
 ECONOMIC_CALENDAR = [
     ('2026-04-29', 'GDP Q1 Advance', 'KXGDP'),
@@ -220,73 +183,33 @@ ECONOMIC_CALENDAR = [
     ('daily', 'ETH Daily Price', 'KXETHD'),
 ]
 
-# ── Weather signal thresholds ─────────────────────────────────────────────────
-WEATHER_EDGE_THRESHOLD = 0.12        # 12 cents (was 0.15 — lower slightly)
-WEATHER_EDGE_THRESHOLD_WINDOW = 0.10  # even lower during model update window
-WEATHER_MAX_DAYS       = 3           # must resolve within 3 days
-WEATHER_TEMP_STD       = 4.0    # 4°F standard deviation for normal dist
+# --- Weather signal thresholds ---
 
-WEATHER_CITIES = {
-    "New York":    {"lat": 40.7128,  "lon": -74.0060},
-    "Chicago":     {"lat": 41.8781,  "lon": -87.6298},
-    "Los Angeles": {"lat": 34.0522,  "lon": -118.2437},
-    "Miami":       {"lat": 25.7617,  "lon": -80.1918},
-    "Dallas":      {"lat": 32.7767,  "lon": -96.7970},
-    "Atlanta":     {"lat": 33.7490,  "lon": -84.3880},
-    "Seattle":     {"lat": 47.6062,  "lon": -122.3321},
-    "Houston":     {"lat": 29.7604,  "lon": -95.3698},
-    "Phoenix":     {"lat": 33.4484,  "lon": -112.0740},
-    "Denver":      {"lat": 39.7392,  "lon": -104.9903},
-    "Boston":      {"lat": 42.3601,  "lon": -71.0589},
-    "Las Vegas":   {"lat": 36.1699,  "lon": -115.1398},
-    "Minneapolis": {"lat": 44.9778,  "lon": -93.2650},
-    "Detroit":     {"lat": 42.3314,  "lon": -83.0458},
-    "Portland":    {"lat": 45.5051,  "lon": -122.6750},
-    "Nashville":   {"lat": 36.1627,  "lon": -86.7816},
-    "London":      {"lat": 51.5074,  "lon": -0.1278},
-    "Toronto":     {"lat": 43.6532,  "lon": -79.3832},
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
 # IN-MEMORY STATE
-# ─────────────────────────────────────────────────────────────────────────────
 
-# Tier 1 → Tier 2 watchlist (top markets from last discovery scan)
+# watchlist from last discovery scan
 watchlist: list = []
 
-# Legacy: tickers from last scan that scored HIGH/MEDIUM (for whale checks)
+# tickers that scored HIGH/MEDIUM last scan
 last_scan_top_markets: list = []
 
-# Tier 2: last known prices + volumes per ticker for delta comparison
-# {ticker: {"mid": float, "volume": float, "timestamp": float}}
+# last known prices/volumes per ticker
+
 last_tier2_snapshot: dict = {}
 
-# Odds velocity tracker: {ticker: [(timestamp, mid_price), ...]}
+# velocity tracker
 price_history: dict = defaultdict(list)
 volume_history: dict = defaultdict(list)
 
-# Cached weather forecasts: {city: {"date": [str], "temp_max": [float]}}
-weather_cache: dict = {}
-weather_cache_time: float = 0.0
-
-# Cached Polymarket markets: list of market dicts
-polymarket_cache: list = []
-polymarket_cache_time: float = 0.0
-
-# Smart money: {ticker: {"poly_side": str, "poly_wallet": str, "poly_size": float, "poly_price": float}}
-smart_money_signals: dict = {}
-last_smart_money: float = 0.0
-
-# Crypto monitor signals: {ticker: {"side": str, "edge": float, "spot": float, "threshold": float, ...}}
+# crypto monitor signals
 crypto_signals: dict = {}
 
-# Fill tracker: track known resting Donnie orders so we can alert when they fill
-# {order_id: {ticker, direction, price_c, contracts, cost}}
+# resting order tracker — alerts on fills
 _known_resting: dict = {}
 
 _orderbook_boost_count = 0
 
-# ── State persistence (survives module reloads by firm.py) ─────────────────
+# --- State persistence (survives module reloads by firm.py) ---
 _DONNIE_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'data')
 DONNIE_STATE_FILE = os.path.join(_DONNIE_DATA_DIR, 'donnie_state.json')
 
@@ -320,9 +243,7 @@ def _load_donnie_state():
     except Exception as e:
         log.warning(f'[STATE] Load failed: {e}')
 
-# ─────────────────────────────────────────────────────────────────────────────
 # LOGGING
-# ─────────────────────────────────────────────────────────────────────────────
 
 os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
 
@@ -342,9 +263,7 @@ try:
 except Exception:
     pass
 
-# ─────────────────────────────────────────────────────────────────────────────
 # AUTH — RSA-PSS (unchanged from v2)
-# ─────────────────────────────────────────────────────────────────────────────
 
 _private_key = None
 
@@ -361,9 +280,8 @@ def _load_private_key():
         log.error(f"Failed to load private key: {e}")
         return None
 
-
 def get_auth_headers(method: str, path: str) -> dict:
-    """Return RSA-PSS signed headers for Kalshi API."""
+    """RSA-PSS signed auth headers."""
     ts  = str(int(time.time() * 1000))
     key = _load_private_key()
     if key is None:
@@ -390,9 +308,7 @@ def get_auth_headers(method: str, path: str) -> dict:
         "Content-Type": "application/json",
     }
 
-# ─────────────────────────────────────────────────────────────────────────────
 # KALSHI API HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
 
 def kalshi_get(path: str, params: dict = None) -> dict:
     url     = KALSHI_BASE + path
@@ -407,7 +323,6 @@ def kalshi_get(path: str, params: dict = None) -> dict:
         log.error(f"Kalshi GET {path} error: {e}")
         return {}
 
-
 def kalshi_post(path: str, body: dict) -> dict:
     url     = KALSHI_BASE + path
     headers = get_auth_headers("POST", "/trade-api/v2" + path)
@@ -421,12 +336,8 @@ def kalshi_post(path: str, body: dict) -> dict:
         log.error(f"Kalshi POST {path} error: {e}")
         return {"error": str(e)}
 
-
 def get_all_open_events_with_markets() -> list:
-    """
-    Paginate /events endpoint with nested markets.
-    ~27 pages @ 200/page = ~5200 events.
-    """
+    """Paginate /events — ~27 pages @ 200/page."""
     events = []
     cursor = None
     page   = 0
@@ -454,40 +365,32 @@ def get_all_open_events_with_markets() -> list:
     log.info(f"Fetched {len(events)} events across {page} pages")
     return events
 
-
 def get_market_detail(ticker: str) -> dict:
-    """Fetch fresh single market data by ticker."""
+    """Fetch single market by ticker."""
     data = kalshi_get(f"/markets/{ticker}")
     return data.get("market", {})
-
 
 def get_trades_for_ticker(ticker: str, limit: int = 50) -> list:
     data = kalshi_get("/markets/trades", params={"ticker": ticker, "limit": limit})
     return data.get("trades", [])
 
-# ─────────────────────────────────────────────────────────────────────────────
 # MARKET ANALYSIS HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
 
 def get_spread(m: dict) -> float:
     ask = float(m.get("yes_ask_dollars") or 1.0)
     bid = float(m.get("yes_bid_dollars") or 0.0)
     return ask - bid
 
-
 def get_mid(m: dict) -> float:
     ask = float(m.get("yes_ask_dollars") or 1.0)
     bid = float(m.get("yes_bid_dollars") or 0.0)
     return (ask + bid) / 2.0
 
-
 def get_volume(m: dict) -> float:
     return float(m.get("volume_fp") or 0.0)
 
-
 def get_volume_24h(m: dict) -> float:
     return float(m.get("volume_24h_fp") or 0.0)
-
 
 def liquidity_score(m: dict) -> float:
     vol    = get_volume(m)
@@ -496,19 +399,17 @@ def liquidity_score(m: dict) -> float:
         return 0.0
     return vol * (1.0 / spread)
 
-
 MIN_TRADEABLE_PRICE = 0.05   # 5¢ — ignore near-certain NO (99¢ YES means terrible payout)
 MAX_TRADEABLE_PRICE = 0.85   # 85¢ — ignore near-certain YES (bad risk/reward on expensive contracts)
 
 def is_liquid(m: dict) -> bool:
     if not (get_volume(m) >= MIN_VOLUME and get_spread(m) < MAX_SPREAD_DOLLARS):
         return False
-    # Filter out extreme-priced markets — terrible risk/reward
+
     mid = get_mid(m)
     if mid < MIN_TRADEABLE_PRICE or mid > MAX_TRADEABLE_PRICE:
         return False
     return True
-
 
 def flatten_events_to_markets(events: list) -> list:
     flat = []
@@ -517,14 +418,12 @@ def flatten_events_to_markets(events: list) -> list:
         markets = event.get("markets") or []
         for m in markets:
             m["_category"] = cat
-            # Ensure order book depth fields are preserved from the API response
-            # (yes_bid_size_fp, yes_ask_size_fp — used by analyze_order_book)
+                    # preserve order book fields for analyze_order_book
             for field in ("yes_bid_size_fp", "yes_ask_size_fp"):
                 if field not in m:
                     m[field] = None
             flat.append(m)
     return flat
-
 
 DONNIE_CATEGORIES = {
     "Economics", "Financials", "Politics", "Crypto",
@@ -535,7 +434,6 @@ DONNIE_CATEGORIES = {
 BRAD_CATEGORIES = {"Sports"}
 MARK_CATEGORIES = {"Climate and Weather"}  # Mark Hanna + weather.py own this
 
-
 def group_by_category(markets: list) -> dict:
     grouped = defaultdict(list)
     for m in markets:
@@ -544,7 +442,6 @@ def group_by_category(markets: list) -> dict:
             continue
         grouped[cat].append(m)
     return dict(grouped)
-
 
 def top_markets_per_category(grouped: dict) -> dict:
     # Priority categories get higher limits so they aren't crowded out
@@ -563,10 +460,8 @@ def top_markets_per_category(grouped: dict) -> dict:
             result[cat] = scored[:limit]
     return result
 
-
 def get_top_volume_markets(markets: list, n: int = 20) -> list:
     return sorted(markets, key=get_volume_24h, reverse=True)[:n]
-
 
 def days_until_close(m: dict) -> int:
     close_time_str = m.get("close_time", "")
@@ -576,9 +471,7 @@ def days_until_close(m: dict) -> int:
     except Exception:
         return 999
 
-# ─────────────────────────────────────────────────────────────────────────────
 # WHALE TRACKER (unchanged from v2)
-# ─────────────────────────────────────────────────────────────────────────────
 
 def parse_trade_time(ts_str: str) -> Optional[datetime]:
     if not ts_str:
@@ -587,7 +480,6 @@ def parse_trade_time(ts_str: str) -> Optional[datetime]:
         return datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
     except Exception:
         return None
-
 
 def get_whale_stats(ticker: str) -> dict:
     trades = get_trades_for_ticker(ticker, limit=50)
@@ -623,7 +515,6 @@ def get_whale_stats(ticker: str) -> dict:
         "yes_contracts": yes_contracts, "no_contracts": no_contracts,
     }
 
-
 def analyze_whale_trades(ticker: str) -> list:
     stats  = get_whale_stats(ticker)
     alerts = []
@@ -642,12 +533,8 @@ def analyze_whale_trades(ticker: str) -> list:
             })
     return alerts
 
-
 def compute_whale_boost(yes_count: int, no_count: int, direction: str) -> tuple:
-    """
-    Returns (boost_float, whale_summary_str).
-    Same direction: +10/+25/+40. Opposing: -15 penalty.
-    """
+    """Whale boost: same direction +10/+25/+40, opposing -15."""
     if direction == "YES":
         same_dir, opp_dir, opp_label = yes_count, no_count, "NO"
     else:
@@ -664,344 +551,9 @@ def compute_whale_boost(yes_count: int, no_count: int, direction: str) -> tuple:
     else:
         return 0.0, "No whale activity"
 
-# ─────────────────────────────────────────────────────────────────────────────
 # WEATHER SIGNAL LAYER
-# ─────────────────────────────────────────────────────────────────────────────
 
-def norm_cdf(x: float, loc: float, scale: float) -> float:
-    """Normal CDF — uses scipy if available, otherwise Abramowitz & Stegun approximation."""
-    if SCIPY_AVAILABLE:
-        return float(norm.cdf(x, loc=loc, scale=scale))
-    # Approximation: erf-based
-    import math
-    z = (x - loc) / (scale * math.sqrt(2))
-    return 0.5 * (1.0 + math.erf(z))
-
-
-def in_weather_model_update_window() -> bool:
-    """Returns True if we're within 30 minutes after a model update."""
-    now = datetime.now(timezone.utc)
-    h, m = now.hour, now.minute
-    # Model updates at ~00:30, 06:30, 12:30, 18:30 UTC
-    for update_hour in [0, 6, 12, 18]:
-        # Window: 5 min before update to 30 min after
-        start_min = update_hour * 60 + 25  # 5 min before
-        end_min   = update_hour * 60 + 60  # 30 min after
-        now_min   = h * 60 + m
-        if start_min <= now_min <= end_min:
-            log.debug(f"[Weather] In model update window (update_hour={update_hour}, now_min={now_min})")
-            return True
-    return False
-
-
-def fetch_weather_forecasts() -> dict:
-    """
-    Fetch Open-Meteo max temp forecasts for all WEATHER_CITIES using 3 models.
-    Returns {city_name: {"dates": [...], "temp_max": [...], "temp_std": [...]}}
-    Multi-model consensus: GFS, ECMWF IFS, GEM Global.
-    Free API — no key needed.
-    """
-    import statistics
-    MODELS = ["gfs_seamless", "ecmwf_ifs025", "gem_global"]
-    MODEL_KEYS = [
-        "temperature_2m_max_gfs_seamless",
-        "temperature_2m_max_ecmwf_ifs025",
-        "temperature_2m_max_gem_global",
-    ]
-
-    result = {}
-    for city, coords in WEATHER_CITIES.items():
-        url = (
-            f"https://api.open-meteo.com/v1/forecast"
-            f"?latitude={coords['lat']}&longitude={coords['lon']}"
-            f"&daily=temperature_2m_max"
-            f"&models=gfs_seamless,ecmwf_ifs025,gem_global"
-            f"&temperature_unit=fahrenheit"
-            f"&forecast_days=7&timezone=auto"
-        )
-        try:
-            r = requests.get(url, timeout=10)
-            if r.status_code == 200:
-                data = r.json()
-                daily = data.get("daily", {})
-                dates = daily.get("time", [])
-                n_days = len(dates)
-
-                # Collect per-model temps
-                model_arrays = []
-                for key in MODEL_KEYS:
-                    vals = daily.get(key, [])
-                    if vals and len(vals) == n_days:
-                        model_arrays.append(vals)
-
-                # Fall back to default key if multi-model not returned
-                if not model_arrays:
-                    fallback = daily.get("temperature_2m_max", [])
-                    model_arrays = [fallback] if fallback else []
-
-                if not model_arrays or not dates:
-                    log.warning(f"[Weather] {city}: no usable forecast data")
-                    continue
-
-                # Consensus: mean and std across available models per day
-                consensus_temps = []
-                consensus_stds  = []
-                for i in range(n_days):
-                    day_vals = [arr[i] for arr in model_arrays if arr[i] is not None]
-                    if not day_vals:
-                        consensus_temps.append(None)
-                        consensus_stds.append(WEATHER_TEMP_STD)
-                        continue
-                    mean_t = sum(day_vals) / len(day_vals)
-                    if len(day_vals) >= 2:
-                        std_t = statistics.stdev(day_vals)
-                    else:
-                        std_t = WEATHER_TEMP_STD
-                    consensus_temps.append(round(mean_t, 1))
-                    consensus_stds.append(round(std_t, 2))
-
-                result[city] = {
-                    "dates":    dates,
-                    "temp_max": consensus_temps,
-                    "temp_std": consensus_stds,
-                }
-                log.info(
-                    f"[Weather] {city} ({len(model_arrays)} models): next 3 days max temps = "
-                    f"{[f'{t:.0f}°F±{s:.1f}' for t, s in zip(consensus_temps[:3], consensus_stds[:3]) if t is not None]}"
-                )
-            else:
-                log.warning(f"[Weather] Open-Meteo {city} → {r.status_code}")
-        except Exception as e:
-            log.error(f"[Weather] Fetch error for {city}: {e}")
-        time.sleep(0.15)
-    return result
-
-
-def weather_implied_prob(forecast_temp: float, threshold: float, above: bool = True,
-                         model_std: float = None) -> float:
-    """
-    P(max_temp > threshold) using normal dist centered on forecast_temp.
-    Scale (std) determined by model consensus spread:
-      std_dev < 2 → scale=2.5 (high model agreement)
-      std_dev > 4 → scale=6.0 (high model disagreement)
-      otherwise   → scale=4.0
-    For "will high be above X?" → above=True.
-    For "will high be below X?" → above=False.
-    """
-    if model_std is not None:
-        if model_std < 2.0:
-            scale = 2.5
-        elif model_std > 4.0:
-            scale = 6.0
-        else:
-            scale = 4.0
-    else:
-        scale = WEATHER_TEMP_STD
-    prob_above = 1.0 - norm_cdf(threshold, loc=forecast_temp, scale=scale)
-    return prob_above if above else (1.0 - prob_above)
-
-
-def _extract_temp_threshold(title: str) -> Optional[float]:
-    """
-    Try to extract a temperature threshold from a market title.
-    e.g. "Will NYC high exceed 75°F on April 15?" → 75.0
-    """
-    patterns = [
-        r'(\d{2,3})\s*°?F',
-        r'(\d{2,3})\s*degrees',
-        r'above\s+(\d{2,3})',
-        r'exceed\s+(\d{2,3})',
-        r'over\s+(\d{2,3})',
-        r'below\s+(\d{2,3})',
-        r'under\s+(\d{2,3})',
-    ]
-    for pat in patterns:
-        m = re.search(pat, title, re.IGNORECASE)
-        if m:
-            return float(m.group(1))
-    return None
-
-
-def _is_above_market(title: str) -> bool:
-    """Does the market resolve YES if temp is above threshold?"""
-    lower = title.lower()
-    above_words = ["above", "exceed", "over", "high", "warm"]
-    below_words = ["below", "under", "cold", "low"]
-    above_score = sum(1 for w in above_words if w in lower)
-    below_score = sum(1 for w in below_words if w in lower)
-    return above_score >= below_score
-
-
-def find_weather_signals(all_markets: list, weather_data: dict,
-                         edge_threshold: float = None) -> list:
-    """
-    Cross-reference Kalshi weather markets against Open-Meteo forecasts.
-    Returns list of weather signal dicts with edge calculation.
-    """
-    if not weather_data:
-        return []
-
-    effective_threshold = edge_threshold if edge_threshold is not None else WEATHER_EDGE_THRESHOLD
-
-    # Filter to weather/climate markets
-    weather_markets = [
-        m for m in all_markets
-        if "Climate" in m.get("_category", "") or "Weather" in m.get("_category", "")
-    ]
-    log.info(f"[Weather] Checking {len(weather_markets)} climate/weather markets")
-
-    signals = []
-    now = datetime.now(timezone.utc)
-
-    for m in weather_markets:
-        title  = (m.get("title") or "").strip()
-        ticker = m.get("ticker", "")
-        mid    = get_mid(m)
-
-        if not title or not ticker or not is_liquid(m):
-            continue
-
-        # Must resolve within WEATHER_MAX_DAYS days
-        close_dt_str = m.get("close_time", "")
-        try:
-            close_dt = datetime.fromisoformat(close_dt_str.replace("Z", "+00:00"))
-            days_out  = (close_dt - now).days
-        except Exception:
-            days_out = 999
-
-        if days_out > WEATHER_MAX_DAYS or days_out < 0:
-            continue
-
-        # Match to a city
-        matched_city = None
-        for city in WEATHER_CITIES:
-            city_key = city.lower().replace(" ", "")
-            title_key = title.lower().replace(" ", "")
-            # Also check common abbreviations
-            abbr_map = {
-                "new york": ["nyc", "new york", "new york city"],
-                "los angeles": ["la", "los angeles"],
-                "chicago": ["chicago", "chi"],
-                "miami": ["miami"],
-                "dallas": ["dallas", "dfw"],
-                "atlanta": ["atlanta", "atl"],
-                "seattle": ["seattle", "sea"],
-            }
-            aliases = abbr_map.get(city.lower(), [city.lower()])
-            if any(alias in title.lower() for alias in aliases):
-                matched_city = city
-                break
-
-        if not matched_city or matched_city not in weather_data:
-            continue
-
-        forecast = weather_data[matched_city]
-        if not forecast["dates"] or not forecast["temp_max"]:
-            continue
-
-        # Try to match forecast date to close date
-        forecast_temp = None
-        idx = None
-        try:
-            close_date_str = close_dt.strftime("%Y-%m-%d")
-            if close_date_str in forecast["dates"]:
-                idx = forecast["dates"].index(close_date_str)
-                forecast_temp = forecast["temp_max"][idx]
-            else:
-                # Use nearest available day
-                idx = min(days_out, len(forecast["temp_max"]) - 1)
-                forecast_temp = forecast["temp_max"][idx]
-        except Exception:
-            forecast_temp = forecast["temp_max"][0] if forecast["temp_max"] else None
-
-        if forecast_temp is None:
-            continue
-
-        # Extract threshold from title
-        threshold = _extract_temp_threshold(title)
-        if threshold is None:
-            continue
-
-        above = _is_above_market(title)
-
-        # Get model std for this day if available
-        forecast_std = None
-        try:
-            std_arr = forecast.get("temp_std", [])
-            if std_arr and idx is not None:
-                forecast_std = std_arr[min(idx, len(std_arr) - 1)]
-        except Exception:
-            pass
-
-        model_prob = weather_implied_prob(forecast_temp, threshold, above=above, model_std=forecast_std)
-        kalshi_prob = mid  # Kalshi mid IS the implied probability
-
-        edge = abs(model_prob - kalshi_prob)
-
-        log.info(
-            f"[Weather] {ticker} | {matched_city} | "
-            f"forecast={forecast_temp:.1f}°F threshold={threshold:.0f}°F "
-            f"above={above} | model_prob={model_prob:.2f} kalshi_prob={kalshi_prob:.2f} "
-            f"edge={edge:.2f} | days_out={days_out}"
-        )
-
-        if edge >= effective_threshold:
-            direction = "YES" if model_prob > kalshi_prob else "NO"
-            signals.append({
-                "ticker":       ticker,
-                "title":        title,
-                "city":         matched_city,
-                "forecast_temp":round(forecast_temp, 1),
-                "threshold":    threshold,
-                "above":        above,
-                "model_prob":   round(model_prob, 3),
-                "kalshi_prob":  round(kalshi_prob, 3),
-                "edge":         round(edge, 3),
-                "direction":    direction,
-                "days_out":     days_out,
-                "mid_c":        int(mid * 100),
-                "_market":      m,
-                "signal_type":  "WEATHER",
-                "confidence_boost": 0.20,   # weather signals get boosted confidence
-            })
-
-    signals.sort(key=lambda x: x["edge"], reverse=True)
-    log.info(f"[Weather] Found {len(signals)} signals above {effective_threshold:.0%} edge threshold")
-    return signals
-
-
-def run_weather_refresh(all_markets: list = None, dry_run: bool = False,
-                        edge_threshold: float = None) -> list:
-    """Refresh weather cache and compute new signals. Returns signal list."""
-    global weather_cache, weather_cache_time
-
-    in_window = in_weather_model_update_window()
-    if edge_threshold is None:
-        edge_threshold = WEATHER_EDGE_THRESHOLD_WINDOW if in_window else WEATHER_EDGE_THRESHOLD
-
-    log.info(
-        f"[Weather] Refreshing Open-Meteo forecasts... "
-        f"(model_update_window={in_window}, edge_threshold={edge_threshold:.2f})"
-    )
-    weather_cache      = fetch_weather_forecasts()
-    weather_cache_time = time.time()
-
-    if all_markets:
-        signals = find_weather_signals(all_markets, weather_cache, edge_threshold=edge_threshold)
-        if signals and dry_run:
-            log.info("[Weather] === WEATHER SIGNALS ===")
-            for s in signals:
-                log.info(
-                    f"  {s['city']}: forecast {s['forecast_temp']}°F vs threshold {s['threshold']}°F "
-                    f"| model_prob={s['model_prob']:.0%} kalshi_prob={s['kalshi_prob']:.0%} "
-                    f"| edge={s['edge']:.0%} | {s['ticker']}"
-                )
-        return signals
-    return []
-
-# ─────────────────────────────────────────────────────────────────────────────
 # GDPNOW PROBABILITY CALCULATOR
-# ─────────────────────────────────────────────────────────────────────────────
 
 FRED_API_KEY = os.environ.get("FRED_API_KEY", "c642f045085a5318c95d0f38d44b42d2")
 
@@ -1049,10 +601,7 @@ def fetch_gdpnow_realtime() -> Optional[float]:
         log.debug(f"[EconModel] GDPNow CSV fallback failed: {e}")
     return None
 
-
-# ─────────────────────────────────────────────────────────────────────────────
 # DAILY CRYPTO/COMMODITY MARKET SEED
-# ─────────────────────────────────────────────────────────────────────────────
 
 DAILY_PRICE_SERIES = {
     'KXBTCD':  {'asset': 'BTC',  'category': 'CRYPTO_SHORT'},
@@ -1100,10 +649,7 @@ def fetch_daily_price_markets() -> list:
     log.info(f"[DailyPrice] Found {len(markets)} daily price markets (BTC/ETH/Gold/Oil)")
     return markets
 
-
-# ─────────────────────────────────────────────────────────────────────────────
 # CLEVELAND FED CPI NOWCAST
-# ─────────────────────────────────────────────────────────────────────────────
 
 def fetch_cleveland_cpi() -> dict:
     """
@@ -1145,7 +691,6 @@ def fetch_cleveland_cpi() -> dict:
 
     return result
 
-
 def calculate_cpi_edge(ticker: str, kalshi_mid: float) -> tuple:
     """Edge calculation for CPI/PCE markets using Cleveland Fed data."""
     ticker_upper = ticker.upper()
@@ -1174,7 +719,6 @@ def calculate_cpi_edge(ticker: str, kalshi_mid: float) -> tuple:
         edge = model_prob_yes - kalshi_mid
         return model_prob_yes, edge, "YES", f"ClevFed={model_cpi:.2f}%>{threshold}%"
 
-
 def calculate_gdp_edge(ticker: str, kalshi_mid: float) -> tuple:
     """Returns (model_prob, edge, direction, source) for GDP markets."""
     match = re.search(r'T(-?\d+\.?\d*)', ticker.upper())
@@ -1195,10 +739,7 @@ def calculate_gdp_edge(ticker: str, kalshi_mid: float) -> tuple:
         edge = model_prob_yes - kalshi_mid
         return model_prob_yes, edge, "YES", f"GDPNow={gdpnow:.1f}%>{threshold}%"
 
-
-# ─────────────────────────────────────────────────────────────────────────────
 # CRYPTO & COMMODITY PRICE EDGE CALCULATORS
-# ─────────────────────────────────────────────────────────────────────────────
 
 def get_crypto_spot() -> dict:
     """Get current BTC and ETH spot prices from CoinGecko."""
@@ -1217,7 +758,6 @@ def get_crypto_spot() -> dict:
     except Exception as e:
         log.debug(f"[Crypto] CoinGecko failed: {e}")
     return {}
-
 
 def calculate_crypto_edge(ticker: str, kalshi_mid: float) -> tuple:
     """
@@ -1259,11 +799,9 @@ def calculate_crypto_edge(ticker: str, kalshi_mid: float) -> tuple:
 
     return None, 0.0, "NO", "parse_error"
 
-
 def fetch_gas_price() -> float:
     """Fetch latest US gas price from FRED (GASREGCOVW series)."""
     return fetch_fred_series("GASREGCOVW")
-
 
 def get_commodity_prices() -> dict:
     """
@@ -1307,7 +845,6 @@ def get_commodity_prices() -> dict:
     else:
         log.warning("[Commodity] No prices from Stooq — all commodity edge calcs will skip")
     return prices
-
 
 def calculate_commodity_edge(ticker: str, kalshi_mid: float) -> tuple:
     """
@@ -1360,10 +897,7 @@ def calculate_commodity_edge(ticker: str, kalshi_mid: float) -> tuple:
 
     return None, 0.0, "NO", "parse_error"
 
-
-# ─────────────────────────────────────────────────────────────────────────────
 # NEWS RSS SCANNER
-# ─────────────────────────────────────────────────────────────────────────────
 
 def run_news_scan(watchlist_markets: list, dry_run: bool = False) -> list:
     """
@@ -1415,219 +949,11 @@ def run_news_scan(watchlist_markets: list, dry_run: bool = False) -> list:
 
     return matches
 
-
-# ─────────────────────────────────────────────────────────────────────────────
 # POLYMARKET SIGNAL LAYER
-# ─────────────────────────────────────────────────────────────────────────────
 
-STOP_WORDS = {"will", "the", "a", "in", "of", "by", "be", "to", "on", "at",
-              "is", "it", "an", "or", "and", "for", "with", "that", "this"}
-
-
-def tokenize_title(title: str) -> set:
-    """Lowercase, remove punctuation, split to words, remove stop words."""
-    words = re.findall(r'\b[a-z0-9]+\b', title.lower())
-    return {w for w in words if w not in STOP_WORDS and len(w) > 2}
-
-
-def fuzzy_match_titles(kalshi_title: str, poly_title: str) -> int:
-    """Returns number of overlapping significant keywords."""
-    k_tokens = tokenize_title(kalshi_title)
-    p_tokens = tokenize_title(poly_title)
-    return len(k_tokens & p_tokens)
-
-
-def fetch_polymarket_markets(limit: int = POLY_FETCH_LIMIT) -> list:
-    """
-    Fetch active Polymarket markets sorted by volume descending.
-    No auth needed — public API.
-    """
-    all_markets = []
-    offset = 0
-    per_page = 100
-
-    while len(all_markets) < limit:
-        try:
-            url = (
-                f"https://gamma-api.polymarket.com/markets"
-                f"?limit={per_page}&offset={offset}&active=true&closed=false"
-            )
-            r = requests.get(url, timeout=15)
-            if r.status_code == 200:
-                batch = r.json()
-                if not batch:
-                    break
-                all_markets.extend(batch)
-                offset += per_page
-                if len(batch) < per_page:
-                    break
-            else:
-                log.warning(f"[Polymarket] API → {r.status_code}")
-                break
-        except Exception as e:
-            log.error(f"[Polymarket] Fetch error: {e}")
-            break
-        time.sleep(0.3)
-
-    # Sort by volume descending
-    def _poly_volume(m):
-        try:
-            return float(m.get("volume", 0) or 0)
-        except Exception:
-            return 0.0
-
-    all_markets.sort(key=_poly_volume, reverse=True)
-    log.info(f"[Polymarket] Fetched {len(all_markets)} markets")
-    return all_markets[:limit]
-
-
-def get_poly_mid(poly_market: dict) -> Optional[float]:
-    """Extract YES mid price from Polymarket market. Returns None if can't parse."""
-    try:
-        prices = poly_market.get("outcomePrices", [])
-        if isinstance(prices, list) and len(prices) >= 1:
-            return float(prices[0])
-        if isinstance(prices, str):
-            parsed = json.loads(prices)
-            if isinstance(parsed, list) and len(parsed) >= 1:
-                return float(parsed[0])
-    except Exception:
-        pass
-    return None
-
-
-def find_polymarket_arb(watchlist_markets: list, poly_markets: list) -> list:
-    """
-    Cross-reference watchlist markets vs Polymarket.
-    Returns list of arb opportunity dicts with spread > POLY_ARB_MIN_SPREAD.
-    """
-    if not poly_markets:
-        return []
-
-    arb_opportunities = []
-
-    for km in watchlist_markets:
-        k_title  = km.get("title", "") or ""
-        k_ticker = km.get("ticker", "")
-        k_mid    = get_mid(km)
-
-        if not k_title or not k_ticker:
-            continue
-
-        best_match  = None
-        best_score  = 0
-        best_poly   = None
-
-        for pm in poly_markets:
-            p_title = pm.get("question", "") or ""
-            score   = fuzzy_match_titles(k_title, p_title)
-            if score > best_score:
-                best_score  = score
-                best_match  = p_title
-                best_poly   = pm
-
-        if best_score < POLY_MATCH_MIN_WORDS or best_poly is None:
-            continue
-
-        poly_mid = get_poly_mid(best_poly)
-        if poly_mid is None:
-            continue
-
-        # Quality check: both markets should resolve within 60 days
-        k_days = days_until_close(km)
-        poly_end_date_str = best_poly.get("endDate") or best_poly.get("end_date_iso") or ""
-        poly_days = 999
-        try:
-            if poly_end_date_str:
-                poly_end = datetime.fromisoformat(poly_end_date_str.replace("Z", "+00:00"))
-                poly_days = max(0, (poly_end - datetime.now(timezone.utc)).days)
-        except Exception:
-            pass
-
-        if k_days > 60 or poly_days > 60:
-            log.debug(
-                f"[Polymarket] Skip arb {k_ticker}: resolve too far out "
-                f"(kalshi={k_days}d poly={poly_days}d)"
-            )
-            continue
-
-        spread = abs(k_mid - poly_mid)
-
-        log.info(
-            f"[Polymarket] Match ({best_score} kw): {k_ticker} "
-            f"| Kalshi={k_mid:.2f} Poly={poly_mid:.2f} spread={spread:.2f} "
-            f"kalshi_days={k_days} poly_days={poly_days}"
-        )
-
-        if spread >= POLY_ARB_MIN_SPREAD:
-            log.info(
-                f"[Polymarket] ARB FOUND: {k_ticker} | Kalshi={k_mid:.2f} "
-                f"Poly={poly_mid:.2f} spread={spread:.2f}"
-            )
-            arb_opportunities.append({
-                "ticker":        k_ticker,
-                "kalshi_title":  k_title,
-                "poly_title":    best_match,
-                "kalshi_mid":    round(k_mid, 3),
-                "poly_mid":      round(poly_mid, 3),
-                "arb_spread":    round(spread, 3),
-                "match_score":   best_score,
-                "poly_volume":   float(best_poly.get("volume", 0) or 0),
-            })
-        elif spread >= 0.04:
-            log.info(
-                f"[Polymarket] Near-arb: {k_ticker} | spread={spread:.2f} "
-                f"(need {POLY_ARB_MIN_SPREAD}) Kalshi={k_mid:.2f} Poly={poly_mid:.2f}"
-            )
-
-    arb_opportunities.sort(key=lambda x: x["arb_spread"], reverse=True)
-    log.info(f"[Polymarket] Found {len(arb_opportunities)} arb opportunities (>{POLY_ARB_MIN_SPREAD:.0%} spread)")
-    return arb_opportunities
-
-
-def run_polymarket_sync(watchlist_markets: list = None, dry_run: bool = False) -> list:
-    """Refresh Polymarket cache and find arb. Returns arb opportunity list."""
-    global polymarket_cache, polymarket_cache_time
-
-    log.info("[Polymarket] Syncing market prices...")
-    polymarket_cache      = fetch_polymarket_markets()
-    polymarket_cache_time = time.time()
-
-    if not watchlist_markets or not polymarket_cache:
-        return []
-
-    arbs = find_polymarket_arb(watchlist_markets, polymarket_cache)
-
-    # Polymarket arb alerts disabled — fuzzy matching produces false positives
-    # Polymarket has no GDP markets; spurious matches generate garbage alerts
-    # Re-enable when exact market ID matching is implemented
-    if POLYMARKET_ENABLED and arbs:
-        lines = ["🔀 **POLYMARKET ARB ALERT**", ""]
-        for arb in arbs[:5]:  # top 5
-            k_c = int(arb["kalshi_mid"] * 100)
-            p_c = int(arb["poly_mid"] * 100)
-            s_c = int(arb["arb_spread"] * 100)
-            if arb["kalshi_mid"] < arb["poly_mid"]:
-                cheaper_side = "Kalshi"
-                direction = "YES"
-            else:
-                cheaper_side = "Polymarket"
-                direction = "NO"
-            lines.append(
-                f"🔀 ARB: {arb['ticker']} Kalshi={k_c}¢ Poly={p_c}¢ spread={s_c}¢ "
-                f"— buy cheaper side ({cheaper_side}), direction={direction}"
-            )
-        msg = "\n".join(lines)
-        post_discord(msg, dry_run=dry_run)
-
-    return arbs
-
-# ─────────────────────────────────────────────────────────────────────────────
 # ODDS VELOCITY TRACKER
-# ─────────────────────────────────────────────────────────────────────────────
 
 MAX_PRICE_HISTORY = 20   # max samples per ticker
-
 
 def update_price_history(ticker: str, mid_price: float, volume: float = 0.0):
     """Record a price + volume sample for velocity tracking."""
@@ -1641,7 +967,6 @@ def update_price_history(ticker: str, mid_price: float, volume: float = 0.0):
         price_history[ticker] = price_history[ticker][-MAX_PRICE_HISTORY:]
     if len(volume_history[ticker]) > MAX_PRICE_HISTORY:
         volume_history[ticker] = volume_history[ticker][-MAX_PRICE_HISTORY:]
-
 
 def compute_velocity(ticker: str, lookback_sec: float = 60.0) -> dict:
     """
@@ -1718,9 +1043,7 @@ def compute_velocity(ticker: str, lookback_sec: float = 60.0) -> dict:
 
     return result
 
-# ─────────────────────────────────────────────────────────────────────────────
 # MARKET CLASSIFIER — edge-quality tier assignment
-# ─────────────────────────────────────────────────────────────────────────────
 
 def classify_market(ticker: str, title: str, category: str, days_until_close_val: int) -> str:
     """Classify market into scoring tier based on edge quality."""
@@ -1814,10 +1137,7 @@ def classify_market(ticker: str, title: str, category: str, days_until_close_val
     # ── Default ───────────────────────────────────────────────────────────────
     return 'POLITICAL_NEWS'
 
-
-# ─────────────────────────────────────────────────────────────────────────────
 # FEATURE 7: ORDER BOOK DEPTH ANALYSIS
-# ─────────────────────────────────────────────────────────────────────────────
 
 def analyze_order_book(m: dict) -> float:
     """
@@ -1859,10 +1179,7 @@ def analyze_order_book(m: dict) -> float:
             log.info(f'[OB] Order book boost fired! count={_orderbook_boost_count}, score={result:.3f}')
     return result
 
-
-# ─────────────────────────────────────────────────────────────────────────────
 # FEATURE 8: TIME-OF-DAY DATA RELEASE ALERTS
-# ─────────────────────────────────────────────────────────────────────────────
 
 def in_release_window() -> bool:
     """Returns True if we're currently within a data release window."""
@@ -1876,10 +1193,7 @@ def in_release_window() -> bool:
             return True
     return False
 
-
-# ─────────────────────────────────────────────────────────────────────────────
 # MARKET SCORING — liquidity + whale + velocity + weather signals
-# ─────────────────────────────────────────────────────────────────────────────
 
 def score_market(m: dict, weather_signals: dict = None) -> dict:
     """
@@ -1890,7 +1204,6 @@ def score_market(m: dict, weather_signals: dict = None) -> dict:
     mid    = get_mid(m)
     liq    = liquidity_score(m)
 
-    # Normalize base confidence by volume proxy
     vol = get_volume(m)
     base_conf = min(1.0, vol / 50000.0) * 0.5 + min(1.0, liq / 1e8) * 0.5
 
@@ -1990,19 +1303,17 @@ def score_market(m: dict, weather_signals: dict = None) -> dict:
         "_market":           m,
     }
 
-
 def score_and_rank_markets(
     top_by_cat: dict,
     weather_signals: list = None,
-    smart_money: dict = None,
+
     crypto_sigs: dict = None,
 ) -> tuple:
     """
     Flatten top_by_cat, score top candidates, return ranked plays.
     Uses edge-quality composite scoring: tier_multiplier * (base_liq*0.4 + edge_score*0.6).
     JUNK markets (tier 0.0) are excluded entirely.
-    weather_signals: list from find_weather_signals().
-    smart_money: dict from run_smart_money_tracker().
+    weather_signals: list of weather signal dicts.
     crypto_sigs: dict from run_crypto_monitor().
     Returns (plays_list, whale_events_total).
     """
@@ -2170,23 +1481,6 @@ def score_and_rank_markets(
         play["orderbook_boost"] = orderbook_boost
         play["composite_score"] = round(composite, 4)
 
-        # Smart money boost
-        if smart_money and ticker in smart_money:
-            sm = smart_money[ticker]
-            smart_money_boost = 0.25
-            play["confidence"] = min(1.0, play["confidence"] + smart_money_boost)
-            play["conf_label"] = (
-                "HIGH"   if play["confidence"] >= CONFIDENCE_HIGH_THRESHOLD else
-                "MEDIUM" if play["confidence"] >= CONFIDENCE_MEDIUM_THRESHOLD else
-                "LOW"
-            )
-            play["composite_score"] = round(play["composite_score"] + smart_money_boost, 4)
-            play["smart_money_note"] = (
-                f"SMART MONEY: {ticker} — top Polymarket trader positioned "
-                f"{sm['poly_side']} @ {sm['poly_price']:.2f}"
-            )
-            log.info(play["smart_money_note"])
-
         # Crypto signal boost
         if crypto_sigs and ticker in crypto_sigs:
             cs = crypto_sigs[ticker]
@@ -2241,9 +1535,7 @@ def score_and_rank_markets(
 
     return plays, whale_events_total
 
-# ─────────────────────────────────────────────────────────────────────────────
 # GDP STOP-LOSS MONITOR
-# ─────────────────────────────────────────────────────────────────────────────
 
 def check_stop_losses(dry_run: bool = False):
     """Check if any open position has hit stop-loss threshold."""
@@ -2275,10 +1567,7 @@ def check_stop_losses(dry_run: bool = False):
         except Exception as e:
             log.debug(f"[STOPLOSS] Error checking {ticker}: {e}")
 
-
-# ─────────────────────────────────────────────────────────────────────────────
 # DISCORD OUTPUT
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _load_donnie_token() -> str:
     token = os.environ.get("DONNIE_TOKEN", "")
@@ -2294,9 +1583,7 @@ def _load_donnie_token() -> str:
         log.error(f"Could not load DONNIE_TOKEN: {e}")
     return ""
 
-
 DONNIE_TOKEN = _load_donnie_token()
-
 
 def post_discord(message: str, channel_id: int = DISCORD_CH_KALSHI, dry_run: bool = False) -> bool:
     """Post message to a Discord channel via Donnie bot (max 2000 chars per chunk)."""
@@ -2327,14 +1614,12 @@ def post_discord(message: str, channel_id: int = DISCORD_CH_KALSHI, dry_run: boo
             return False
     return True
 
-
 def format_donnie_report(
     plays: list,
     total_scanned: int,
     n_cats: int,
     whale_events: int,
     weather_signals: list = None,
-    arb_opps: list = None,
 ) -> str:
     """
     Format the single curated Donnie report Discord post.
@@ -2382,26 +1667,12 @@ def format_donnie_report(
             )
         lines.append("")
 
-    # Polymarket arb section
-    if arb_opps:
-        lines += [sep, "🔀 **POLYMARKET ARB**", ""]
-        for arb in arb_opps[:3]:
-            k_c = int(arb["kalshi_mid"] * 100)
-            p_c = int(arb["poly_mid"] * 100)
-            s_c = int(arb["arb_spread"] * 100)
-            lines.append(
-                f"  ARB: {arb['kalshi_title'][:55]} — "
-                f"Kalshi: {k_c}¢ vs Poly: {p_c}¢ | Spread: {s_c}¢"
-            )
-        lines.append("")
-
     lines += [
         sep,
-        f"Next discovery: 30min | Realtime monitor: 30sec | Weather: 15min | Poly: 5min",
+        f"Next discovery: 30min | Realtime monitor: 30sec",
     ]
 
     return "\n".join(lines)
-
 
 def format_whale_update(ticker: str, title: str, alert: dict) -> str:
     contracts = int(alert["total_contracts"])
@@ -2413,7 +1684,6 @@ def format_whale_update(ticker: str, title: str, alert: dict) -> str:
         f"This market was already flagged — conviction increasing."
     )
 
-
 def format_tier2_alert(ticker: str, title: str, trigger: str, play: dict) -> str:
     return (
         f"⚡ **TIER2 TRIGGER** — `{ticker}`\n"
@@ -2424,9 +1694,7 @@ def format_tier2_alert(ticker: str, title: str, trigger: str, play: dict) -> str
         f"Velocity: {play['velocity_label']}"
     )
 
-# ─────────────────────────────────────────────────────────────────────────────
 # EXECUTION ENGINE (unchanged from v2)
-# ─────────────────────────────────────────────────────────────────────────────
 
 def get_balance() -> float:
     data = kalshi_get("/portfolio/balance")
@@ -2435,7 +1703,6 @@ def get_balance() -> float:
     log.info(f"[EXEC] Portfolio balance: ${balance_dollars:.2f} (raw: {balance_cents}¢)")
     return balance_dollars
 
-
 def get_open_orders_tickers() -> set:
     data   = kalshi_get("/portfolio/orders", params={"status": "resting"})
     orders = data.get("orders", [])
@@ -2443,7 +1710,6 @@ def get_open_orders_tickers() -> set:
     if tickers:
         log.info(f"[EXEC] Open orders on tickers: {tickers}")
     return tickers
-
 
 def get_open_positions() -> dict:
     data      = kalshi_get("/portfolio/positions")
@@ -2463,14 +1729,12 @@ def get_open_positions() -> dict:
     log.info(f"[EXEC] Open positions+orders ({len(result)}): {sorted(result.keys())}")
     return result
 
-
 def get_total_exposure(positions: dict = None) -> float:
     if positions is None:
         positions = get_open_positions()
     total = sum(positions.values())
     log.info(f"[EXEC] Total exposure: ${total:.2f}")
     return total
-
 
 def calculate_contracts(signal: dict, balance: float) -> int:
     conf = signal.get("confidence", 0.0)
@@ -2494,12 +1758,8 @@ def calculate_contracts(signal: dict, balance: float) -> int:
 
     return contracts
 
-
 def should_execute(signal: dict, balance: float, positions: dict, total_exposure: float) -> tuple:
-    """
-    Check all guardrails. Returns (ok: bool, reason: str).
-    NON-NEGOTIABLE — never bypass.
-    """
+    """Check all guardrails. Returns (ok, reason). Never bypass."""
     ticker    = signal.get("ticker", "UNKNOWN")
     direction = signal.get("direction", "YES")
     mid_c     = signal.get("mid_c", 50)
@@ -2598,7 +1858,6 @@ def should_execute(signal: dict, balance: float, positions: dict, total_exposure
 
     return True, "all guardrails passed"
 
-
 def execute_trade(signal: dict, dry_run: bool = False) -> dict:
     ticker    = signal.get("ticker", "")
     direction = signal.get("direction", "YES")
@@ -2696,7 +1955,6 @@ def execute_trade(signal: dict, dry_run: bool = False) -> dict:
     )
     return result
 
-
 def post_execution_result(signal: dict, result: dict, dry_run: bool = False):
     ticker    = signal.get("ticker", "UNKNOWN")
     title     = signal.get("title", "")[:80]
@@ -2745,7 +2003,6 @@ def post_execution_result(signal: dict, result: dict, dry_run: bool = False):
         )
 
     post_discord(msg, channel_id=DISCORD_CH_RESULTS, dry_run=dry_run)
-
 
 def run_execution_check(plays: list, dry_run: bool = False):
     """Check HIGH-confidence signals and execute if guardrails pass."""
@@ -2834,16 +2091,14 @@ def run_execution_check(plays: list, dry_run: bool = False):
         except Exception as e:
             log.error(f"[EXEC] Error processing {signal.get('ticker', '?')}: {e}", exc_info=True)
 
-# ─────────────────────────────────────────────────────────────────────────────
 # TIER 1 — DISCOVERY SCAN
-# ─────────────────────────────────────────────────────────────────────────────
 
 def run_discovery_scan(dry_run: bool = False) -> tuple:
     """
     Full market scan. Updates global watchlist for Tier 2.
     Returns (all_markets_flat, plays, weather_signals, arb_opps).
     """
-    global watchlist, last_scan_top_markets, weather_cache, polymarket_cache
+    global watchlist, last_scan_top_markets
 
     log.info("=" * 60)
     log.info("TIER 1 — DISCOVERY SCAN starting")
@@ -2867,15 +2122,13 @@ def run_discovery_scan(dry_run: bool = False) -> tuple:
     top_by_cat = top_markets_per_category(grouped)
     log.info(f"Categories with liquid markets: {len(top_by_cat)}")
 
-    # Weather is Mark Hanna's domain — Donnie does not process weather signals
-    weather_signals = []
+    weather_signals = []  # weather is Mark Hanna's domain
 
     # Score everything (inject smart money + crypto signals)
     log.info(f"Scoring top {WHALE_FETCH_TOP_N} candidates...")
     plays, whale_events = score_and_rank_markets(
         top_by_cat,
         weather_signals=weather_signals,
-        smart_money=smart_money_signals,
         crypto_sigs=crypto_signals,
     )
 
@@ -2924,18 +2177,12 @@ def run_discovery_scan(dry_run: bool = False) -> tuple:
                 f"[News] Boosted {play['ticker']}: conf {old_conf:.2f} → {play['confidence']:.2f}"
             )
 
-    # Polymarket arb (use cached if fresh enough)
     arb_opps = []
-    if POLYMARKET_ENABLED:
-        if polymarket_cache:
-            arb_opps = find_polymarket_arb(watchlist, polymarket_cache)
-        else:
-            arb_opps = run_polymarket_sync(watchlist, dry_run=dry_run)
 
     # Silent mode — only post to Discord on trade execution or arb alerts
     # Scan reports are suppressed to avoid noise. Daily heartbeat handled separately.
     report = format_donnie_report(plays, len(all_markets), len(top_by_cat), whale_events,
-                                   weather_signals=weather_signals, arb_opps=arb_opps)
+                                   weather_signals=weather_signals)
     if report:
         log.info(f"Scan found {len([p for p in plays if p.get('conf_label') in ('HIGH','MEDIUM')])} actionable plays — suppressing Discord report (silent mode)")
     else:
@@ -2948,9 +2195,7 @@ def run_discovery_scan(dry_run: bool = False) -> tuple:
 
     return all_markets, plays, weather_signals, arb_opps
 
-# ─────────────────────────────────────────────────────────────────────────────
 # TIER 2 — REAL-TIME MONITOR
-# ─────────────────────────────────────────────────────────────────────────────
 
 def check_order_fills(dry_run: bool = False):
     """
@@ -2996,7 +2241,6 @@ def check_order_fills(dry_run: bool = False):
 
     except Exception as e:
         log.debug(f"[FILL] check_order_fills error: {e}")
-
 
 def run_realtime_monitor(dry_run: bool = False):
     """
@@ -3134,9 +2378,7 @@ def run_realtime_monitor(dry_run: bool = False):
 
         time.sleep(0.2)
 
-# ─────────────────────────────────────────────────────────────────────────────
 # WHALE SCAN (legacy 15-min check — kept from v2)
-# ─────────────────────────────────────────────────────────────────────────────
 
 def run_whale_scan(markets: list, dry_run: bool = False):
     """Legacy 15-min whale scan. Internal only — posts Discord only for radar tickers."""
@@ -3172,221 +2414,9 @@ def run_whale_scan(markets: list, dry_run: bool = False):
     if found == 0:
         log.info("[Whale] No accumulation detected")
 
-# ─────────────────────────────────────────────────────────────────────────────
 # POLYMARKET SMART MONEY TRACKER
-# ─────────────────────────────────────────────────────────────────────────────
 
-SMART_MONEY_TOP_N = 50   # top traders to track
-
-def fetch_polymarket_top_traders() -> list:
-    """
-    Fetch top Polymarket traders by PnL.
-    Strategy:
-      1. Scrape polymarket.com/leaderboard HTML for proxyWallet addresses (most reliable)
-      2. Fallback: gamma-api JSON endpoint (sometimes available)
-      3. Fallback: data-api users endpoint
-    Returns list of dicts with at least a proxyWallet field.
-    """
-    # Strategy 1: Scrape leaderboard HTML — proxyWallet addresses are embedded as JSON
-    try:
-        r = requests.get(
-            "https://polymarket.com/leaderboard",
-            timeout=15,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; DonnieBot/3.0)"},
-        )
-        if r.status_code == 200:
-            # Extract proxyWallet addresses from the page HTML
-            wallets = re.findall(r'"proxyWallet"\s*:\s*"(0x[0-9a-fA-F]{40})"', r.text)
-            if wallets:
-                # Deduplicate preserving order
-                seen = set()
-                unique_wallets = []
-                for w in wallets:
-                    if w.lower() not in seen:
-                        seen.add(w.lower())
-                        unique_wallets.append(w)
-                traders = [{"proxyWallet": w} for w in unique_wallets[:SMART_MONEY_TOP_N]]
-                log.info(f"[SmartMoney] Scraped {len(traders)} wallet addresses from leaderboard page")
-                return traders
-        log.warning(f"[SmartMoney] leaderboard page scrape → {r.status_code}")
-    except Exception as e:
-        log.warning(f"[SmartMoney] leaderboard page scrape error: {e}")
-
-    # Strategy 2: gamma-api leaderboard JSON (may return 404 — keep as future-proofing)
-    try:
-        url = f"https://gamma-api.polymarket.com/leaderboard?window=monthly&limit={SMART_MONEY_TOP_N}"
-        r = requests.get(url, timeout=15)
-        if r.status_code == 200:
-            data = r.json()
-            if isinstance(data, list) and data:
-                log.info(f"[SmartMoney] gamma leaderboard returned {len(data)} traders")
-                return data
-            if isinstance(data, dict):
-                for key in ("leaderboard", "data", "results", "profiles"):
-                    if key in data and isinstance(data[key], list):
-                        log.info(f"[SmartMoney] gamma leaderboard[{key}]: {len(data[key])} traders")
-                        return data[key]
-        log.debug(f"[SmartMoney] gamma leaderboard → {r.status_code} (expected if API deprecated)")
-    except Exception as e:
-        log.debug(f"[SmartMoney] gamma leaderboard error: {e}")
-
-    # Strategy 3: data-api users
-    try:
-        url = (
-            f"https://data-api.polymarket.com/users"
-            f"?limit={SMART_MONEY_TOP_N}&orderBy=profitAndLoss&sortOrder=DESC&window=30d"
-        )
-        r = requests.get(url, timeout=15)
-        if r.status_code == 200:
-            data = r.json()
-            if isinstance(data, list):
-                log.info(f"[SmartMoney] data-api users returned {len(data)} traders")
-                return data
-            if isinstance(data, dict):
-                for key in ("data", "users", "results"):
-                    if key in data and isinstance(data[key], list):
-                        log.info(f"[SmartMoney] data-api users[{key}]: {len(data[key])} traders")
-                        return data[key]
-        log.debug(f"[SmartMoney] data-api users → {r.status_code}")
-    except Exception as e:
-        log.error(f"[SmartMoney] data-api users error: {e}")
-
-    log.warning("[SmartMoney] All leaderboard sources exhausted — no traders fetched")
-    return []
-
-
-def _extract_wallet(trader: dict) -> Optional[str]:
-    """Extract wallet address from a Polymarket trader profile dict."""
-    for field in ("proxyWallet", "proxy_wallet", "address", "wallet", "user"):
-        val = trader.get(field, "")
-        if val and isinstance(val, str) and val.startswith("0x"):
-            return val.lower()
-    return None
-
-
-def fetch_trader_positions(wallet: str, limit: int = 20) -> list:
-    """
-    Fetch top positions for a given Polymarket wallet address.
-    Returns list of position dicts.
-    """
-    try:
-        url = (
-            f"https://data-api.polymarket.com/positions"
-            f"?user={wallet}&limit={limit}&sortBy=size&sortOrder=DESC"
-        )
-        r = requests.get(url, timeout=12)
-        if r.status_code == 200:
-            data = r.json()
-            if isinstance(data, list):
-                return data
-            if isinstance(data, dict):
-                for key in ("data", "positions", "results"):
-                    if key in data and isinstance(data[key], list):
-                        return data[key]
-        else:
-            log.debug(f"[SmartMoney] positions {wallet[:10]}… → {r.status_code}")
-    except Exception as e:
-        log.debug(f"[SmartMoney] positions fetch error ({wallet[:10]}…): {e}")
-    return []
-
-
-def run_smart_money_tracker(dry_run: bool = False) -> dict:
-    """
-    Step 1–3: Fetch top traders, get their positions, cross-ref with Kalshi watchlist.
-    Updates global smart_money_signals.
-    Returns {ticker: signal_dict}.
-    """
-    global smart_money_signals, last_smart_money
-
-    log.info("[SmartMoney] Starting smart money tracker scan...")
-
-    traders = fetch_polymarket_top_traders()
-    if not traders:
-        log.warning("[SmartMoney] No traders returned — smart money signals unavailable this cycle")
-        return smart_money_signals
-
-    log.info(f"[SmartMoney] Processing {len(traders)} top traders")
-
-    # Build watchlist title lookup (ticker → title)
-    watchlist_titles = {}
-    if watchlist:
-        for m in watchlist:
-            t = m.get("ticker", "")
-            title = m.get("title", "")
-            if t and title:
-                watchlist_titles[t] = title
-
-    new_signals = {}
-    wallets_checked = 0
-
-    for trader in traders[:SMART_MONEY_TOP_N]:
-        wallet = _extract_wallet(trader)
-        if not wallet:
-            continue
-
-        positions = fetch_trader_positions(wallet, limit=20)
-        wallets_checked += 1
-
-        for pos in positions:
-            # Extract position fields — Polymarket uses various field names
-            poly_title = (
-                pos.get("title") or pos.get("market", {}).get("question", "")
-                if isinstance(pos.get("market"), dict)
-                else pos.get("title", "")
-            )
-            side  = (pos.get("side") or pos.get("outcome", "YES")).upper()
-            size  = float(pos.get("size") or pos.get("currentValue") or pos.get("value") or 0)
-            price = float(pos.get("avgPrice") or pos.get("averagePrice") or pos.get("entryPrice") or 0)
-
-            if not poly_title or size <= 0:
-                continue
-
-            # Cross-reference with our Kalshi watchlist
-            for k_ticker, k_title in watchlist_titles.items():
-                score = fuzzy_match_titles(k_title, poly_title)
-                if score >= POLY_MATCH_MIN_WORDS:
-                    # Merge: if multiple traders in same market, keep largest position
-                    if k_ticker not in new_signals or size > new_signals[k_ticker]["poly_size"]:
-                        new_signals[k_ticker] = {
-                            "poly_side":   side,
-                            "poly_wallet": wallet,
-                            "poly_size":   size,
-                            "poly_price":  price,
-                            "poly_title":  poly_title[:80],
-                            "match_score": score,
-                        }
-                        log.info(
-                            f"[SmartMoney] MATCH: {k_ticker} ↔ '{poly_title[:60]}' "
-                            f"| wallet={wallet[:12]}… side={side} size={size:.0f} price={price:.2f}"
-                        )
-
-        # Pace requests — don't hammer the API
-        time.sleep(0.2)
-        if wallets_checked % 10 == 0:
-            log.info(f"[SmartMoney] Checked {wallets_checked}/{len(traders)} wallets, {len(new_signals)} signals so far")
-
-    smart_money_signals = new_signals
-    last_smart_money = time.time()
-
-    log.info(
-        f"[SmartMoney] Scan complete: {wallets_checked} wallets checked, "
-        f"{len(smart_money_signals)} Kalshi cross-references found"
-    )
-
-    if smart_money_signals and dry_run:
-        log.info("[SmartMoney] === SMART MONEY SIGNALS ===")
-        for ticker, sig in smart_money_signals.items():
-            log.info(
-                f"  SMART MONEY: {ticker} — top Polymarket trader positioned {sig['poly_side']} "
-                f"@ {sig['poly_price']:.2f} (size={sig['poly_size']:.0f}) | '{sig['poly_title']}'"
-            )
-
-    return smart_money_signals
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # REAL-TIME CRYPTO PRICE MONITOR
-# ─────────────────────────────────────────────────────────────────────────────
 
 CRYPTO_IDS = {
     "bitcoin":  {"symbol": "BTC", "coingecko_id": "bitcoin"},
@@ -3419,7 +2449,6 @@ def fetch_crypto_prices() -> dict:
         log.error(f"[Crypto] Price fetch error: {e}")
     return {}
 
-
 def _spot_to_prob(spot: float, threshold: float) -> float:
     """
     Convert spot price vs threshold into an implied probability for a
@@ -3433,7 +2462,6 @@ def _spot_to_prob(spot: float, threshold: float) -> float:
     if pct_diff > -1.0:  return 0.40
     if pct_diff > -2.0:  return 0.20
     return 0.08
-
 
 def _extract_crypto_threshold(title: str) -> Optional[float]:
     """
@@ -3461,13 +2489,11 @@ def _extract_crypto_threshold(title: str) -> Optional[float]:
                 pass
     return None
 
-
 def _is_above_crypto_market(title: str) -> bool:
     """Return True if market resolves YES when price is ABOVE threshold."""
     lower = title.lower()
     below_words = ["below", "under", "less than", "no higher"]
     return not any(w in lower for w in below_words)
-
 
 def _market_resolves_within_hours(m: dict, hours: int = 24) -> bool:
     """Return True if the market resolves within `hours` hours from now."""
@@ -3478,7 +2504,6 @@ def _market_resolves_within_hours(m: dict, hours: int = 24) -> bool:
         return 0 < delta <= hours
     except Exception:
         return False
-
 
 def run_crypto_monitor(dry_run: bool = False) -> dict:
     """
@@ -3608,10 +2633,7 @@ def run_crypto_monitor(dry_run: bool = False) -> dict:
 
     return crypto_signals
 
-
-# ─────────────────────────────────────────────────────────────────────────────
 # STALE ORDER CLEANUP
-# ─────────────────────────────────────────────────────────────────────────────
 
 def cancel_stale_orders(dry_run: bool = False):
     """Cancel Donnie limit orders that have been resting for more than ORDER_MAX_AGE_HOURS."""
@@ -3643,101 +2665,9 @@ def cancel_stale_orders(dry_run: bool = False):
     except Exception as e:
         log.debug(f"[STALE] cancel_stale_orders error: {e}")
 
-
-# ─────────────────────────────────────────────────────────────────────────────
 # STINK BID STRATEGY — for Brad (importable, NOT used by Donnie)
-# ─────────────────────────────────────────────────────────────────────────────
 
-def run_stink_bid_strategy(markets: list, balance: float, dry_run: bool = False) -> list:
-    """
-    BRAD'S STINK BID STRATEGY — importable function, NOT called by Donnie.
-
-    For each sports market: place a limit BUY at 30% discount from current mid.
-    Cancel and re-place every 15 minutes if unfilled.
-    If filled: hold to expiration.
-    Max allocation: 2% of balance per market.
-
-    Args:
-        markets: list of market dicts (with ticker, title, yes_ask_dollars, etc.)
-        balance: current cash balance in dollars
-        dry_run: if True, log only — don't place orders
-
-    Returns:
-        list of order result dicts
-    """
-    results         = []
-    max_per_market  = balance * 0.02   # 2% max per stink bid
-
-    for m in markets:
-        ticker = m.get("ticker", "")
-        title  = (m.get("title") or "")[:60]
-        mid    = get_mid(m)
-
-        if not ticker or mid <= 0:
-            continue
-
-        # Stink price: 30% discount from current mid
-        stink_price_dollars = mid * 0.70
-        stink_price_c       = max(1, min(99, int(round(stink_price_dollars * 100))))
-
-        # Max contracts at stink price within 2% allocation
-        if stink_price_dollars > 0:
-            max_contracts = math.floor(max_per_market / stink_price_dollars)
-        else:
-            max_contracts = 0
-
-        if max_contracts <= 0:
-            log.info(f"[StinkBid] {ticker}: 0 contracts at 2% allocation — skipping")
-            continue
-
-        cost = max_contracts * stink_price_dollars
-        client_id = f"brad-stink-{uuid.uuid4()}"
-
-        order_body = {
-            "ticker":          ticker,
-            "client_order_id": client_id,
-            "type":            "limit",
-            "action":          "buy",
-            "side":            "yes",
-            "count":           max_contracts,
-            "yes_price":       stink_price_c,
-        }
-
-        log.info(
-            f"[StinkBid] {'[DRY RUN] ' if dry_run else ''}{ticker} | "
-            f"mid={int(mid*100)}¢ stink={stink_price_c}¢ x{max_contracts} "
-            f"(cost=${cost:.2f} | {title})"
-        )
-
-        if dry_run:
-            results.append({
-                "ticker":          ticker,
-                "status":          "dry_run",
-                "stink_price_c":   stink_price_c,
-                "contracts":       max_contracts,
-                "cost":            cost,
-                "client_order_id": client_id,
-            })
-            continue
-
-        resp  = kalshi_post("/portfolio/orders", order_body)
-        order = resp.get("order", {})
-
-        results.append({
-            "ticker":          ticker,
-            "status":          order.get("status", "failed"),
-            "order_id":        order.get("order_id", client_id),
-            "stink_price_c":   stink_price_c,
-            "contracts":       max_contracts,
-            "cost":            cost,
-        })
-        time.sleep(0.3)
-
-    return results
-
-# ─────────────────────────────────────────────────────────────────────────────
 # GDP RESEARCH — Q1 2026 ADVANCE ESTIMATE (April 30, 2026)
-# ─────────────────────────────────────────────────────────────────────────────
 
 GDP_THESIS = {
     "release_date":   "2026-04-30",
@@ -3751,43 +2681,6 @@ GDP_THESIS = {
     "verdict": "HOLD all three NO positions — strong consensus for weak Q1 GDP",
     "risk": "If Q1 data excludes tariff impact or is revised strongly upward",
 }
-
-
-def fetch_gdpnow() -> Optional[float]:
-    """
-    Fetch latest Atlanta Fed GDPNow estimate. Returns annualized % or None.
-    Primary: FRED API CSV for GDPNOW series.
-    Fallback: Atlanta Fed page scrape.
-    """
-    # Primary: FRED API CSV
-    try:
-        r = requests.get(
-            "https://fred.stlouisfed.org/graph/fredgraph.csv?id=GDPNOW",
-            timeout=10, headers={"User-Agent": "Mozilla/5.0"}
-        )
-        if r.status_code == 200:
-            lines = r.text.strip().split('\n')
-            # Last line has latest value: DATE,VALUE
-            last = lines[-1].split(',')
-            if len(last) == 2:
-                val = float(last[1])
-                log.info(f"[EconModel] GDPNow: {val:.2f}%")
-                return val
-    except Exception as e:
-        log.debug(f"[EconModel] GDPNow FRED fetch failed: {e}")
-
-    # Fallback: Atlanta Fed page scrape
-    try:
-        r = requests.get("https://www.atlantafed.org/cqer/research/gdpnow", timeout=10)
-        match = re.search(r'GDPNow.*?(-?\d+\.\d+)%', r.text)
-        if match:
-            val = float(match.group(1))
-            log.info(f"[EconModel] GDPNow (scrape fallback): {val:.2f}%")
-            return val
-    except Exception:
-        pass
-    return None
-
 
 def fetch_fedwatch_hold_prob() -> float:
     """Fetch CME FedWatch implied probability of Fed hold at next meeting."""
@@ -3812,25 +2705,6 @@ def fetch_fedwatch_hold_prob() -> float:
         log.debug(f"[EconModel] FedWatch fetch failed: {e}")
     return 0.95  # fallback: assume ~95% hold
 
-
-def fetch_cleveland_inflation() -> Optional[float]:
-    """Fetch Cleveland Fed inflation nowcast for CPI estimate."""
-    try:
-        r = requests.get(
-            "https://www.clevelandfed.org/en/our-research/indicators-and-data/inflation-nowcasting.aspx",
-            timeout=10
-        )
-        # Look for current CPI estimate in page
-        match = re.search(r'(\d+\.\d+)\s*%?\s*(?:CPI|inflation)', r.text, re.IGNORECASE)
-        if match:
-            val = float(match.group(1))
-            log.info(f"[EconModel] Cleveland CPI nowcast: {val:.2f}%")
-            return val
-    except Exception as e:
-        log.debug(f"[EconModel] Cleveland inflation fetch failed: {e}")
-    return None
-
-
 def calculate_economic_edge(ticker: str, kalshi_mid: float) -> tuple:
     """
     For a given economic market ticker, fetch the relevant model estimate
@@ -3842,7 +2716,7 @@ def calculate_economic_edge(ticker: str, kalshi_mid: float) -> tuple:
 
     # GDP markets: KXGDP-26APR30-T{threshold}
     if 'KXGDP' in ticker_upper and 'APR30' in ticker_upper:
-        gdpnow = fetch_gdpnow()
+        gdpnow = fetch_gdpnow_realtime()
         if gdpnow is None:
             return None, 0.0, "NO", "unavailable"
 
@@ -3874,17 +2748,21 @@ def calculate_economic_edge(ticker: str, kalshi_mid: float) -> tuple:
 
     return None, 0.0, "NO", "no_model"
 
-
 def run_gdp_research(open_positions: dict = None) -> dict:
     """
     Build and log the GDP thesis for the Q1 2026 advance estimate (April 30).
     Call once at startup if any GDP market is in open positions.
-    Returns the GDP_THESIS dict (with live GDPNow estimate if fetchable).
+    Returns GDP thesis with live GDPNow.
     """
-    thesis = dict(GDP_THESIS)
+    thesis = {
+        "release_date": "2026-04-30",
+        "our_estimate": -1.5,
+        "verdict": "HOLD NO positions — consensus for weak Q1 GDP",
+        "risk": "Q1 data excludes tariff impact or revised upward",
+    }
 
     # Try to get live GDPNow estimate
-    gdpnow = fetch_gdpnow()
+    gdpnow = fetch_gdpnow_realtime()
     if gdpnow is not None:
         thesis["gdpnow_live"] = gdpnow
         log.info(f"[GDP] Atlanta Fed GDPNow live estimate: {gdpnow:+.1f}%")
@@ -3909,10 +2787,7 @@ def run_gdp_research(open_positions: dict = None) -> dict:
 
     return thesis
 
-
-# ─────────────────────────────────────────────────────────────────────────────
 # MAIN
-# ─────────────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description="Donnie v3 — Two-tier Kalshi scanner")
@@ -3927,7 +2802,6 @@ def main():
     if dry_run:   modes.append("DRY-RUN")
     if scan_once: modes.append("SCAN-ONCE")
     log.info(f"Donnie v3 starting [{', '.join(modes) if modes else 'CONTINUOUS'}]")
-    log.info(f"Scipy available: {SCIPY_AVAILABLE}")
 
     if scan_once:
         # GDP research — always run at startup; checks for GDP markets in open positions
@@ -3941,8 +2815,6 @@ def main():
         in_window = in_weather_model_update_window()
         log.info(f"[Weather] Model update window active: {in_window}")
 
-        # Run smart money + crypto monitors first so signals are ready for scoring
-        run_smart_money_tracker(dry_run=dry_run)
         run_crypto_monitor(dry_run=dry_run)
 
         # One full discovery scan
@@ -3953,22 +2825,6 @@ def main():
             print("SCAN-ONCE SUMMARY")
             print("=" * 60)
             print(f"Total markets scanned: {len(all_markets)}")
-            print(f"Weather signals found: {len(weather_signals)}")
-            if weather_signals:
-                for ws in weather_signals:
-                    print(
-                        f"  [{ws['city']}] forecast={ws['forecast_temp']}°F "
-                        f"threshold={ws['threshold']:.0f}°F "
-                        f"model={ws['model_prob']:.0%} kalshi={ws['kalshi_prob']:.0%} "
-                        f"edge={ws['edge']:.0%} ticker={ws['ticker']}"
-                    )
-            print(f"Polymarket arb opps: {len(arb_opps)}")
-            if arb_opps:
-                for arb in arb_opps[:3]:
-                    print(
-                        f"  [{arb['ticker']}] kalshi={int(arb['kalshi_mid']*100)}¢ "
-                        f"poly={int(arb['poly_mid']*100)}¢ spread={int(arb['arb_spread']*100)}¢"
-                    )
             print(f"Velocity tracker initialized: {len(price_history)} tickers")
 
             # Top 5 plays from new edge-quality scoring
@@ -3997,9 +2853,6 @@ def main():
     # ── Continuous two-tier loop ──────────────────────────────────────────────
     last_discovery   = 0.0
     last_realtime    = 0.0
-    last_weather     = 0.0
-    last_polymarket  = 0.0
-    last_smart_money_ts = 0.0
     last_crypto_ts   = 0.0
     last_heartbeat   = 0.0
     HEARTBEAT_INTERVAL_SEC = 86400  # daily heartbeat at 9am UTC
@@ -4021,16 +2874,6 @@ def main():
             check_order_fills(dry_run=dry_run)
             run_realtime_monitor(dry_run=dry_run)
             last_realtime = time.time()
-
-        # Weather is Mark Hanna/weather.py's domain — Donnie does not scan or execute weather
-
-        if POLYMARKET_ENABLED and now - last_polymarket >= POLYMARKET_REFRESH_INTERVAL_SEC * interval_multiplier:
-            run_polymarket_sync(watchlist, dry_run=dry_run)
-            last_polymarket = time.time()
-
-        if POLYMARKET_ENABLED and now - last_smart_money_ts >= SMART_MONEY_INTERVAL_SEC * interval_multiplier:
-            run_smart_money_tracker(dry_run=dry_run)
-            last_smart_money_ts = time.time()
 
         if now - last_crypto_ts >= CRYPTO_MONITOR_INTERVAL_SEC * interval_multiplier:
             run_crypto_monitor(dry_run=dry_run)
@@ -4056,9 +2899,8 @@ def main():
 
         time.sleep(5)
 
-
 def run_scan(post=None, **kwargs):
-    """Entry point for firm.py orchestrator. Runs a single discovery scan."""
+    """Entry point for firm.py — runs one discovery scan."""
     run_discovery_scan(dry_run=False)
     _save_donnie_state()
     try:
@@ -4068,7 +2910,6 @@ def run_scan(post=None, **kwargs):
         write_agent_status("economics", {'status': 'ran', 'markets_scanned': 0})
     except Exception:
         pass
-
 
 if __name__ == "__main__":
     main()
