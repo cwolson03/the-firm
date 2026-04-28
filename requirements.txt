@@ -1,0 +1,25 @@
+# Core dependencies
+requests>=2.31.0
+python-dotenv>=1.0.0
+cryptography>=41.0.0
+scipy>=1.11.0
+feedparser>=6.0.10
+
+# Intelligence layer
+chromadb>=0.4.0
+sentence-transformers>=2.2.0
+numpy>=1.24.0
+
+# Dashboard API
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+
+# Optional: LLM providers (keys configured in .env)
+# anthropic>=0.18.0
+# openai>=1.0.0
+
+# Utilities
+python-dateutil>=2.8.0
+
+# Testing
+pytest>=7.4.0

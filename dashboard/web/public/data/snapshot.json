@@ -1,0 +1,7 @@
+{
+  "snapshot_date": "2026-04-28",
+  "snapshot_label": "Apr 28, 2026",
+  "note": "Live data snapshot. The RAG Stock Finder makes real-time API calls. All other data is from this snapshot.",
+  "live_features": ["rag-demo"],
+  "static_features": ["positions", "weather", "sports", "portfolio", "activity"]
+}

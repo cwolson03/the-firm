@@ -1,0 +1,33 @@
+name: Tests
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    
+    - name: Install dependencies
+      run: |
+        pip install requests python-dotenv scipy feedparser chromadb \
+                    sentence-transformers numpy fastapi uvicorn pytest
+    
+    - name: Run response parser tests
+      run: pytest tests/test_response_parser.py -v
+    
+    - name: Run RAG tests (store-independent only)
+      run: pytest tests/test_rag_retrieval.py::TestWithoutStore -v
+    
+    # Full RAG integration tests require initialized store (skip in CI)
+    # To run locally: python3 bots/rag_ingest.py --bootstrap && pytest tests/

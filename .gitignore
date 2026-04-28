@@ -1,0 +1,38 @@
+# Secrets — never commit
+config/bot-tokens.env
+config/keys.env
+config/kalshi.env
+*.pem
+*.key
+.env
+.env.*
+
+# Logs
+config/firm.log
+logs/
+*.log
+
+# Runtime data (gitignore sensitive position/state data)
+config/jordan_positions.json
+data/shared_state.json
+data/brad_paper_trades.json
+data/rugrat_seen.json
+data/supervisor_state.json
+data/jordan_state.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+.Python
+build/
+dist/
+*.egg-info/
+
+# Kalshi cache
+bot/kalshi/cache/
+bot/kalshi/logs/
+
+# OS
+.DS_Store
+Thumbs.db
