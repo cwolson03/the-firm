@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
-firm.py — entry point for The Firm
+FIRM.PY — The Master Coordinator
+The Firm
 
-Delegates to bots/firm.py. Run from project root:
-  python3 firm.py [args]
+All bots. One command. python3 firm.py
+
+"The most important thing is to have fun. The second most important
+thing is to have fun." — Mark Hanna
 """
 
 import os
@@ -149,7 +152,7 @@ def run_kalshi_scanner():
         else:
             log.warning("[ECONOMICS] economics.py has no run_scan() function")
     except Exception as e:
-        err = f"❌ **DONNIE V2 (Kalshi) FAILED**: {e}"
+        err = f"❌ **ECONOMICS FAILED**: {e}"
         log.error(err)
         log_to_discord(err)
 
@@ -164,7 +167,7 @@ def run_sports_scanner():
         else:
             log.warning("[SPORTS] sports.py has no run_scan() function")
     except Exception as e:
-        err = f"❌ **BRAD (Sports) FAILED**: {e}"
+        err = f"❌ **SPORTS FAILED**: {e}"
         log.error(err)
         log_to_discord(err)
 
@@ -173,7 +176,7 @@ def run_weather_scanner():
     log.info('[WEATHER] Running weather scan...')
     try:
         weather_path = os.path.join(BOT_DIR, 'weather.py')
-        mod = load_module('weather', weather_path)
+        mod = reload_module('weather', weather_path)  # reload each time — weather has internal state
         if mod and hasattr(mod, 'run_scan'):
             mod.run_scan(post=True)
         else:
@@ -264,7 +267,7 @@ def run_supervisor():
     log.info('[SUPERVISOR] Running heartbeat check...')
     try:
         sup_path = os.path.join(BOT_DIR, 'supervisor.py')
-        mod = load_module('supervisor', sup_path)
+        mod = reload_module('supervisor', sup_path)  # always reload — supervisor is lightweight
         if mod and hasattr(mod, 'run_scan'):
             mod.run_scan()
         else:
@@ -473,7 +476,7 @@ def main():
     parser.add_argument('--scan',        type=str,            help='Run a specific scanner immediately: kalshi|sports|congress|whale|options|research')
     parser.add_argument('--status',      action='store_true', help='Print status and exit')
     parser.add_argument('--command',     type=str,            help='Run a slash command (e.g. "scan kalshi")')
-    parser.add_argument('--bot',         type=str,            help='Run a single bot standalone: donnie|rugrat|chester|jordan|brad|mark')
+    parser.add_argument('--bot',         type=str,            help='Run a single bot standalone: economics|congressional|crypto|options|sports|research')
     parser.add_argument('--once',        action='store_true', help='Run all bots once then exit (no loop)')
     args = parser.parse_args()
 
@@ -489,11 +492,11 @@ def main():
 
     if args.bot:
         bot_map = {
-            'donnie': ('kalshi', 'Economics — Kalshi scanner'),
-            'rugrat': ('congress', 'Congressional — Congressional tracker'),
-            'chester': ('whale', 'Crypto — Crypto whale tracker'),
-            'jordan': ('options', 'Options — Options coach'),
-            'brad': ('sports', 'Sports — Sports & promo scanner'),
+            'economics': ('kalshi', 'Economics — Kalshi scanner'),
+            'congressional': ('congress', 'Congressional — Congressional tracker'),
+            'crypto': ('whale', 'Crypto — Crypto whale tracker'),
+            'options': ('options', 'Options — Options coach'),
+            'sports': ('sports', 'Sports — Sports & promo scanner'),
             'mark': ('research', 'Weather Intel — Research'),
         }
         key = args.bot.lower()

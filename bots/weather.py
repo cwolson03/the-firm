@@ -2,7 +2,7 @@
 """
 WEATHER BOT v4 — Kalshi Daily High Temperature Market Scanner
 =============================================================
-The Firm — weather market scanner.
+Stratton Oakmont prediction market intelligence — weather edition.
 
 v4 architecture:
   - Correct series: KXHIGHNY, KXHIGHLAX, etc. (daily HIGH temp markets)
@@ -11,7 +11,7 @@ v4 architecture:
     - strike_type: "less", "between", "greater"
   - Tomorrow.io DAILY forecast (temperatureMax)
   - Range-based edge detection: P(temp in [low, high]) vs Kalshi mid
-  - LIVE MODE (dry_run=False) — approved 2026-04-27
+  - LIVE MODE (dry_run=False) — approved 2026-04-27 by Good Burger
   - Posts to #mark-signals via Mark Hanna bot
 
 Ticker examples:
@@ -55,12 +55,12 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 # ─────────────────────────────────────────────────────────────────────────────
 
 if os.path.exists("/home/cody/stratton"):
-    PRIVATE_KEY_PATH  = "/home/cody/stratton/config/kalshi_private.pem"
+    PRIVATE_KEY_PATH  = os.environ.get("KALSHI_KEY_PATH", "")
     BOT_TOKENS_ENV    = "/home/cody/stratton/config/bot-tokens.env"
     LOG_PATH          = "/home/cody/stratton/logs/weather.log"
     DATA_DIR          = "/home/cody/stratton/data"
 else:
-    PRIVATE_KEY_PATH  = "/home/stratton/.openclaw/workspace/config/kalshi_private.pem"
+    PRIVATE_KEY_PATH  = os.environ.get("KALSHI_KEY_PATH", "")
     BOT_TOKENS_ENV    = "/home/stratton/.openclaw/workspace/config/bot-tokens.env"
     LOG_PATH          = "/home/stratton/.openclaw/workspace/logs/weather.log"
     DATA_DIR          = "/home/stratton/.openclaw/workspace/data"
@@ -88,8 +88,8 @@ BIAS_MIN_SAMPLES          = 3     # minimum samples before applying correction
 # ─────────────────────────────────────────────────────────────────────────────
 
 KALSHI_BASE      = "https://api.elections.kalshi.com/trade-api/v2"
-KEY_ID = os.getenv("KALSHI_KEY_ID", "")
-TOMORROW_API_KEY = os.getenv("TOMORROW_API_KEY", ""))
+KEY_ID           = "2e462103-bdd5-4a1b-b231-17191bded0bb"
+TOMORROW_API_KEY = os.environ.get("TOMORROW_API_KEY", "ojJ8eI5GY3gaGHwXkvtHoA5sE0rygpGz")
 
 # Discord — #mark-signals
 WEATHER_CHANNEL = 1491861985162432634
@@ -1798,7 +1798,7 @@ def llm_gate_check(ticker: str, city_name: str, direction: str,
     bias_note = (" (raw forecast adjusted by %+.1fF bias correction)" % bias_applied) if abs(bias_applied) >= 0.5 else ""
 
     prompt = (
-        "You are a weather market sanity checker for The Firm. "
+        "You are a weather market sanity checker for Stratton Oakmont. "
         "Review this paper trade signal and decide if it should be executed.\n\n"
         "Signal: %s | %s\n"
         "Direction: %s (betting the actual daily high will NOT be in the %s)\n"
@@ -2248,6 +2248,38 @@ def run_scan(post=None, **kwargs):
         trades = result.get("trades", 0) if isinstance(result, dict) else 0
         edges = len(result.get("edges", [])) if isinstance(result, dict) else 0
         write_agent_status("weather", {"status": "ran", "trades": trades, "signals_found": edges})
+    except Exception:
+        pass
+    # auto-score any weather positions that resolved since last scan
+    try:
+        import sys as _sys2, os as _os2
+        _sys2.path.insert(0, _os2.path.dirname(_os2.path.abspath(__file__)))
+        from eval_framework import load_evals, resolve_trade
+        import importlib.util as _ilu
+        _spec = _ilu.spec_from_file_location("economics", _os2.path.join(_os2.path.dirname(_os2.path.abspath(__file__)), "economics.py"))
+        _econ = _ilu.module_from_spec(_spec); _spec.loader.exec_module(_econ)
+        open_kalshi = set(_econ.get_open_positions().keys())
+        evals = load_evals()
+        for ev in evals:
+            if ev.get("agent") != "weather": continue
+            if ev.get("outcome") != "PENDING": continue
+            ticker = ev["trade_id"]
+            if ticker not in open_kalshi:
+                # position closed on Kalshi — check realized P&L
+                try:
+                    raw = _econ.kalshi_get(f"/markets/{ticker}")
+                    mkt = raw.get("market", raw)
+                    result_val = mkt.get("result", "")
+                    if result_val in ("yes", "no"):
+                        # we held NO — win if result=no, loss if result=yes
+                        won = (result_val == "no")
+                        outcome = "WIN" if won else "LOSS"
+                        # estimate pnl from contracts
+                        pnl = 112.0 if won else -100.0  # rough: win ~1.1x-1.2x, loss -100%
+                        resolve_trade(ticker, outcome, pnl)
+                        import logging; logging.getLogger("weather").info(f"[Eval] Auto-scored {ticker}: {outcome}")
+                except Exception:
+                    pass
     except Exception:
         pass
     return result

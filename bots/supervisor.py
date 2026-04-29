@@ -48,7 +48,7 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 # ─────────────────────────────────────────────────────────────────────────────
 
 if os.path.exists("/home/cody/stratton"):
-    PRIVATE_KEY_PATH = "/home/cody/stratton/config/kalshi_private.pem"
+    PRIVATE_KEY_PATH = os.environ.get("KALSHI_KEY_PATH", "")
     BOT_TOKENS_ENV   = "/home/cody/stratton/config/bot-tokens.env"
     LOG_PATH         = "/home/cody/stratton/logs/supervisor.log"
     FIRM_LOG_PATH    = "/home/cody/stratton/config/firm.log"
@@ -56,7 +56,7 @@ if os.path.exists("/home/cody/stratton"):
     SPORTS_PY_PATH     = "/home/cody/stratton/bots/sports.py"
     WEATHER_PY_PATH  = "/home/cody/stratton/bots/weather.py"
 else:
-    PRIVATE_KEY_PATH = "/home/stratton/.openclaw/workspace/config/kalshi_private.pem"
+    PRIVATE_KEY_PATH = os.environ.get("KALSHI_KEY_PATH", "")
     BOT_TOKENS_ENV   = "/home/stratton/.openclaw/workspace/config/bot-tokens.env"
     LOG_PATH         = "/home/stratton/.openclaw/workspace/logs/supervisor.log"
     FIRM_LOG_PATH    = "/home/stratton/.openclaw/workspace/config/firm.log"
@@ -65,7 +65,7 @@ else:
     WEATHER_PY_PATH  = "/home/stratton/.openclaw/workspace/research/weather.py"
 
 KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
-KEY_ID = os.getenv("KALSHI_KEY_ID", "")
+KEY_ID      = "2e462103-bdd5-4a1b-b231-17191bded0bb"
 
 GENERAL_CHANNEL = 1491861935354810453   # #general
 ALERT_COOLDOWN_HOURS = 2                # don't repeat the same alert within 2 hours

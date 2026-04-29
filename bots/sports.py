@@ -67,15 +67,15 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 SPORTS_PAPER_MODE = True  # paper mode — flip to False when ready for live sports  # Set to False only when Cody explicitly authorizes live trading
 
 KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
-KEY_ID = os.getenv("KALSHI_KEY_ID", "")
+KEY_ID      = "2e462103-bdd5-4a1b-b231-17191bded0bb"
 
 # Paths — auto-detect Atlas (cody) vs local (stratton)
 if os.path.exists("/home/cody/stratton"):
-    PRIVATE_KEY_PATH = "/home/cody/stratton/config/kalshi_private.pem"
+    PRIVATE_KEY_PATH = os.environ.get("KALSHI_KEY_PATH", "")
     BOT_TOKENS_ENV   = "/home/cody/stratton/config/bot-tokens.env"
     LOG_PATH         = "/home/cody/stratton/logs/brad.log"
 else:
-    PRIVATE_KEY_PATH = "/home/stratton/.openclaw/workspace/config/kalshi_private.pem"
+    PRIVATE_KEY_PATH = os.environ.get("KALSHI_KEY_PATH", "")
     BOT_TOKENS_ENV   = "/home/stratton/.openclaw/workspace/config/bot-tokens.env"
     LOG_PATH         = "/home/stratton/.openclaw/workspace/logs/brad.log"
 

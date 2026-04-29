@@ -38,7 +38,7 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 # ─────────────────────────────────────────────────────────────────────────────
 
 KALSHI_BASE      = "https://api.elections.kalshi.com/trade-api/v2"
-KEY_ID = os.getenv("KALSHI_KEY_ID", "")
+KEY_ID           = "28aebab3-8694-46bc-95f1-2d37d9e9266e"
 PRIVATE_KEY_PATH = os.environ.get("KALSHI_KEY_PATH", "")
 DATA_DIR         = "/home/cody/stratton/data"
 
