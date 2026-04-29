@@ -41,7 +41,7 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 # CONFIG
 
 KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
-KEY_ID      = "2e462103-bdd5-4a1b-b231-17191bded0bb"
+KEY_ID      = ""  # set via KALSHI_KEY_ID env var
 
 # Paths — auto-detect Atlas (cody) vs local (stratton)
 _HOME = os.path.expanduser("~")

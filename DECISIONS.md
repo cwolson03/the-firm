@@ -75,3 +75,35 @@ Payout edge = "how much can I make if I'm right." Directional edge = "does my mo
 ---
 
 *This file grows with the system. Every significant change gets an entry.*
+
+---
+
+## Weather bot architecture update (Apr 29, 2026)
+
+After the first two days of live trading (2W/3L), identified two systematic issues:
+
+**Problem 1:** MAX_ACTIVE_WEATHER_ORDERS was set at 3 — too conservative, limited valid signal capture.
+**Fix:** Raised to 16. Added DAILY_LIVE_BUDGET = $40.00 as the real constraint instead of raw position count.
+
+**Problem 2:** LA trade had model=5%, Kalshi=60% — we saw that as 54 points of NO edge and traded it. But when Kalshi is pricing a bracket 55+ points above the model, the market has information the model doesn't (real-time station data, NWS updates, etc.).
+**Fix:** Added WEATHER_EDGE_MAX = 0.65. Any signal where apparent edge > 65% is now rejected — the market is too certain and we're probably wrong.
+
+**Also changed:** More aggressive prefetch windows during market hours (every 30min 9-11AM ET, hourly afternoon) to keep forecasts fresher during active trading windows.
+
+**Result:** The LA B68.5 trade (model=5%, Kalshi=60%, edge=-54%) would have been rejected by the new cap. Austin B92.5 (model=1%, Kalshi=51%, edge=-50%) just barely passes — worth monitoring.
+
+Dynamic bet sizing: remaining daily budget divided evenly across remaining valid signals per scan.
+
+## ASOS station integration — real-time settlement station data (Apr 29, 2026)
+
+The previous version used general city coordinates that didn't match the exact NWS ASOS station Kalshi uses for settlement. This meant our forecast could be for Midtown Manhattan while the market resolves against Central Park. Two immediate problems:
+1. Chicago was using O'Hare (KORD) coordinates — Kalshi uses Midway (KMDW). Different station.
+2. Houston was using IAH — Kalshi uses Hobby (KHOU). Different station.
+
+Fix: All 19 city entries now include the exact `asos` station code. Each scan pulls:
+- Live current temperature from that station (NWS API, free, no key)
+- 24-hour observed max if available
+
+If ASOS shows the day's observed max already exceeds the model forecast, the forecast gets upgraded. If the current temperature is already above forecast, same upgrade.
+
+This matters most for afternoon trades — by 2PM ET the observed max is often known and completely removes forecast uncertainty for that day.

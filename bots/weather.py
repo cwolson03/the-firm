@@ -2,7 +2,7 @@
 """
 WEATHER BOT v4 — Kalshi Daily High Temperature Market Scanner
 =============================================================
-Stratton Oakmont prediction market intelligence — weather edition.
+The Firm — weather market scanner.
 
 v4 architecture:
   - Correct series: KXHIGHNY, KXHIGHLAX, etc. (daily HIGH temp markets)
@@ -55,12 +55,12 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 # ─────────────────────────────────────────────────────────────────────────────
 
 if os.path.exists("/home/cody/stratton"):
-    PRIVATE_KEY_PATH  = os.environ.get("KALSHI_KEY_PATH", "")
+    PRIVATE_KEY_PATH  = "/home/cody/stratton/config/kalshi_private.pem"
     BOT_TOKENS_ENV    = "/home/cody/stratton/config/bot-tokens.env"
     LOG_PATH          = "/home/cody/stratton/logs/weather.log"
     DATA_DIR          = "/home/cody/stratton/data"
 else:
-    PRIVATE_KEY_PATH  = os.environ.get("KALSHI_KEY_PATH", "")
+    PRIVATE_KEY_PATH  = "/home/stratton/.openclaw/workspace/config/kalshi_private.pem"
     BOT_TOKENS_ENV    = "/home/stratton/.openclaw/workspace/config/bot-tokens.env"
     LOG_PATH          = "/home/stratton/.openclaw/workspace/logs/weather.log"
     DATA_DIR          = "/home/stratton/.openclaw/workspace/data"
@@ -69,6 +69,7 @@ BLOCKS_FILE               = os.path.join(DATA_DIR, "weather_blocks.json")
 WEATHER_PAPER_TRADES_FILE = os.path.join(DATA_DIR, "weather_paper_trades.json")
 FORECAST_CACHE_FILE       = os.path.join(DATA_DIR, "weather_forecast_cache.json")
 PAPER_DEDUP_FILE          = os.path.join(DATA_DIR, "weather_paper_dedup.json")
+LIVE_DEDUP_FILE           = os.path.join(DATA_DIR, "weather_live_dedup.json")
 PAPER_EXPERIMENTS_FILE    = os.path.join(DATA_DIR, "weather_experiments.json")
 WEATHER_ACCURACY_FILE     = os.path.join(DATA_DIR, "weather_accuracy.json")
 BIAS_CACHE_FILE           = os.path.join(DATA_DIR, "weather_bias_cache.json")
@@ -79,7 +80,7 @@ LLM_GATE_TIMEOUT          = 8      # seconds, skip gate if slow
 LLM_GATE_VETO_IN_PAPER    = False  # paper: log veto but still execute
 LLM_GATE_VETO_IN_LIVE     = True   # live: veto blocks execution
 PREFETCH_LOCK_FILE        = os.path.join(DATA_DIR, "weather_prefetch_state.json")
-PREFETCH_WINDOWS_UTC      = [30, 390, 750, 1110]  # minutes from midnight: 00:30, 06:30, 12:30, 18:30
+PREFETCH_WINDOWS_UTC      = [30, 120, 210, 300, 390, 480, 540, 570, 600, 630, 660, 690, 720, 750, 780, 810, 840, 870, 900, 960, 1020, 1080, 1140, 1200, 1260, 1320]  # 26 windows: ~every 90min overnight, every 30min 09-15 UTC (5-11AM ET), hourly afternoon
 PREFETCH_WINDOW_MIN       = 20   # minutes before/after window to trigger prefetch
 BIAS_MIN_SAMPLES          = 3     # minimum samples before applying correction
 
@@ -88,8 +89,9 @@ BIAS_MIN_SAMPLES          = 3     # minimum samples before applying correction
 # ─────────────────────────────────────────────────────────────────────────────
 
 KALSHI_BASE      = "https://api.elections.kalshi.com/trade-api/v2"
-KEY_ID           = "2e462103-bdd5-4a1b-b231-17191bded0bb"
-TOMORROW_API_KEY = os.environ.get("TOMORROW_API_KEY", "ojJ8eI5GY3gaGHwXkvtHoA5sE0rygpGz")
+KEY_ID           = ""  # set via KALSHI_KEY_ID env var
+TOMORROW_API_KEY         = os.environ.get("TOMORROW_API_KEY", ""  # set via TOMORROW_API_KEY env var)  # primary (clean)
+TOMORROW_API_KEY_FALLBACK = os.environ.get("TOMORROW_API_KEY_FALLBACK", ""  # rotate at tomorrow.io)  # secondary (exposed, use if primary exhausted)
 
 # Discord — #mark-signals
 WEATHER_CHANNEL = 1491861985162432634
@@ -119,40 +121,44 @@ WEATHER_SERIES = [
 
 # City info keyed by series prefix
 SERIES_CITY_MAP = {
-    'KXHIGHNY':    {'name': 'New York',       'lat': 40.7128,  'lon': -74.0060},
-    'KXHIGHLAX':   {'name': 'Los Angeles',    'lat': 34.0522,  'lon': -118.2437},
-    'KXHIGHCHI':   {'name': 'Chicago',        'lat': 41.8781,  'lon': -87.6298},
-    'KXHIGHMIA':   {'name': 'Miami',          'lat': 25.7617,  'lon': -80.1918},
-    'KXHIGHTDAL':  {'name': 'Dallas',         'lat': 32.7767,  'lon': -96.7970},
-    'KXHIGHTHOU':  {'name': 'Houston',        'lat': 29.7604,  'lon': -95.3698},
-    'KXHIGHTBOS':  {'name': 'Boston',         'lat': 42.3601,  'lon': -71.0589},
-    'KXHIGHTATL':  {'name': 'Atlanta',        'lat': 33.7490,  'lon': -84.3880},
-    'KXHIGHTPHX':  {'name': 'Phoenix',        'lat': 33.4484,  'lon': -112.0740},
-    'KXHIGHTLV':   {'name': 'Las Vegas',      'lat': 36.1699,  'lon': -115.1398},
-    'KXHIGHTSEA':  {'name': 'Seattle',        'lat': 47.6062,  'lon': -122.3321},
-    'KXHIGHTMIN':  {'name': 'Minneapolis',    'lat': 44.9778,  'lon': -93.2650},
-    'KXHIGHAUS':   {'name': 'Austin',         'lat': 30.2672,  'lon': -97.7431},
-    'KXHIGHTDC':   {'name': 'Washington DC',  'lat': 38.9072,  'lon': -77.0369},
-    'KXHIGHTNOLA': {'name': 'New Orleans',    'lat': 29.9511,  'lon': -90.0715},
-    'KXHIGHTOKC':  {'name': 'Oklahoma City',  'lat': 35.4676,  'lon': -97.5164},
-    'KXHIGHTSFO':  {'name': 'San Francisco',  'lat': 37.7749,  'lon': -122.4194},
-    'KXHIGHTSATX': {'name': 'San Antonio',    'lat': 29.4241,  'lon': -98.4936},
-    'KXHIGHPHIL':  {'name': 'Philadelphia',   'lat': 39.9526,  'lon': -75.1652},
+    # Coordinates match exact NWS settlement station (ASOS) used by Kalshi
+    'KXHIGHNY':    {'name': 'New York',       'lat': 40.7833,  'lon': -73.9667,  'asos': 'KNYC'},   # Central Park
+    'KXHIGHLAX':   {'name': 'Los Angeles',    'lat': 33.9381,  'lon': -118.3889, 'asos': 'KLAX'},   # LAX
+    'KXHIGHCHI':   {'name': 'Chicago',        'lat': 41.7842,  'lon': -87.7553,  'asos': 'KMDW'},   # Midway (NOT O'Hare)
+    'KXHIGHMIA':   {'name': 'Miami',          'lat': 25.7906,  'lon': -80.3164,  'asos': 'KMIA'},   # MIA
+    'KXHIGHTDAL':  {'name': 'Dallas',         'lat': 32.8974,  'lon': -97.0220,  'asos': 'KDFW'},   # DFW
+    'KXHIGHTHOU':  {'name': 'Houston',        'lat': 29.6375,  'lon': -95.2825,  'asos': 'KHOU'},   # Hobby (NOT IAH)
+    'KXHIGHTBOS':  {'name': 'Boston',         'lat': 42.3606,  'lon': -71.0106,  'asos': 'KBOS'},   # Logan
+    'KXHIGHTATL':  {'name': 'Atlanta',        'lat': 33.6403,  'lon': -84.4269,  'asos': 'KATL'},   # Hartsfield
+    'KXHIGHTPHX':  {'name': 'Phoenix',        'lat': 33.4278,  'lon': -112.0035, 'asos': 'KPHX'},   # Sky Harbor
+    'KXHIGHTLV':   {'name': 'Las Vegas',      'lat': 36.0719,  'lon': -115.1634, 'asos': 'KLAS'},   # Harry Reid
+    'KXHIGHTSEA':  {'name': 'Seattle',        'lat': 47.4447,  'lon': -122.3136, 'asos': 'KSEA'},   # Sea-Tac
+    'KXHIGHTMIN':  {'name': 'Minneapolis',    'lat': 44.8831,  'lon': -93.2289,  'asos': 'KMSP'},   # MSP
+    'KXHIGHAUS':   {'name': 'Austin',         'lat': 30.1830,  'lon': -97.6799,  'asos': 'KAUS'},   # Bergstrom
+    'KXHIGHTDC':   {'name': 'Washington DC',  'lat': 38.8483,  'lon': -77.0342,  'asos': 'KDCA'},   # Reagan National
+    'KXHIGHTNOLA': {'name': 'New Orleans',    'lat': 29.9928,  'lon': -90.2508,  'asos': 'KMSY'},   # Armstrong
+    'KXHIGHTOKC':  {'name': 'Oklahoma City',  'lat': 35.3886,  'lon': -97.6003,  'asos': 'KOKC'},   # Will Rogers
+    'KXHIGHTSFO':  {'name': 'San Francisco',  'lat': 37.6196,  'lon': -122.3656, 'asos': 'KSFO'},   # SFO
+    'KXHIGHTSATX': {'name': 'San Antonio',    'lat': 29.5328,  'lon': -98.4636,  'asos': 'KSAT'},   # SAT
+    'KXHIGHPHIL':  {'name': 'Philadelphia',   'lat': 39.8733,  'lon': -75.2268,  'asos': 'KPHL'},   # PHL
 }
 
 # Edge thresholds
 WEATHER_EDGE_THRESHOLD    = 0.28   # 28¢ minimum edge (backtest optimized: >25¢ = 75%+ hit rate)
 WEATHER_EDGE_MAX          = 0.65   # cap - above this kalshi is near certain, model is wrong
 MIN_FORECAST_MARGIN_MULT  = 1.5    # forecast must be >= this * uncertainty from threshold to signal
-MAX_ACTIVE_WEATHER_ORDERS = 3      # max simultaneous LIVE positions
+MAX_ACTIVE_WEATHER_ORDERS = 16     # max simultaneous LIVE positions
 MAX_PAPER_SIGNALS         = 10     # max paper signals per scan cycle (prevent spam)
-MAX_POSITION_PCT          = 0.03   # 3% of balance per trade
+MAX_POSITION_PCT          = 0.03   # fallback only — dynamic sizing used in live mode
+DAILY_LIVE_BUDGET         = 40.0   # total dollars to deploy per day across all signals
+MIN_BET_SIZE              = 2.50   # minimum per-trade dollar amount
+MAX_BET_SIZE              = 15.00  # maximum per-trade dollar amount
 
 # Market filters
 MIN_VOLUME       = 0      # volume check handled inline (API returns None for new markets)
 
 # Cache TTL
-TOMORROW_CACHE_TTL = 21600  # 6 hours — conserve API quota (500/day limit, 19 cities)
+TOMORROW_CACHE_TTL = 43200  # 12 hours — prefetch handles freshness, this is fallback TTL
 
 # Polling
 POLL_INTERVAL_SEC = 300   # 5 minutes
@@ -842,6 +848,25 @@ def update_paper_trade_results(resolved_tickers: dict):
 
 _forecast_mem_cache: dict = {}   # {cache_key: {'data': dict, 'ts': float}}
 
+def _warm_mem_cache_from_disk():
+    """Load disk cache into memory on startup so restarts don't burn API quota."""
+    try:
+        if os.path.exists(FORECAST_CACHE_FILE):
+            with open(FORECAST_CACHE_FILE) as _f:
+                disk = json.load(_f)
+            now_ts = time.time()
+            loaded = 0
+            for k, v in disk.items():
+                # Accept any disk entry — prefetch handles freshness
+                _forecast_mem_cache[k] = v
+                loaded += 1
+            if loaded:
+                log.info("[Cache] Warmed %d entries from disk on startup", loaded)
+    except Exception as e:
+        log.debug("[Cache] Warm-up failed: %s", e)
+
+_warm_mem_cache_from_disk()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FORECAST PREFETCH ENGINE
@@ -960,7 +985,7 @@ def fetch_daily_highs(series: str) -> dict:
 
     # In-memory cache
     cached = _forecast_mem_cache.get(cache_key)
-    if cached and (now_ts - cached['ts']) < TOMORROW_CACHE_TTL:
+    if cached and cached.get('data'):  # use any cached data, prefetch handles freshness
         return cached['data']
 
     # Disk cache
@@ -969,7 +994,7 @@ def fetch_daily_highs(series: str) -> dict:
             with open(FORECAST_CACHE_FILE) as f:
                 disk = json.load(f)
             entry = disk.get(cache_key, {})
-            if (now_ts - entry.get('ts', 0)) < TOMORROW_CACHE_TTL:
+            if (now_ts - entry.get('ts', 0)) < (TOMORROW_CACHE_TTL * 6):  # up to 3 days old on disk beats rate limit
                 data = entry.get('data', {})
                 _forecast_mem_cache[cache_key] = {'data': data, 'ts': entry['ts']}
                 return data
@@ -1026,7 +1051,37 @@ def _fetch_tomorrow_io_daily(series: str, coords: dict) -> dict:
             log.info("[Tomorrow.io] %s: %d daily highs (UTC midnight anchor)", series, len(result))
             return result
         elif r.status_code == 429:
-            log.warning("[Tomorrow.io] Rate limited for %s", series)
+            log.warning("[Tomorrow.io] Primary key rate limited for %s — trying fallback key", series)
+            # Try fallback key
+            try:
+                r2 = requests.get(
+                    "https://api.tomorrow.io/v4/timelines",
+                    params={
+                        "location":  "%s,%s" % (coords['lat'], coords['lon']),
+                        "fields":    "temperatureMax",
+                        "units":     "imperial",
+                        "timesteps": "1d",
+                        "startTime": today_utc,
+                        "endTime":   "nowPlus5d",
+                        "apikey":    TOMORROW_API_KEY_FALLBACK,
+                    },
+                    timeout=15,
+                )
+                if r2.status_code == 200:
+                    intervals2 = r2.json()["data"]["timelines"][0]["intervals"]
+                    result2 = {}
+                    for iv in intervals2:
+                        date_str = iv["startTime"][:10]
+                        temp_max = iv["values"].get("temperatureMax")
+                        if temp_max is not None:
+                            result2[date_str] = float(temp_max)
+                    if result2:
+                        log.info("[Tomorrow.io] Fallback key OK for %s: %d highs", series, len(result2))
+                        return result2
+                elif r2.status_code == 429:
+                    log.warning("[Tomorrow.io] Both keys rate limited for %s", series)
+            except Exception as e2:
+                log.debug("[Tomorrow.io] Fallback key failed for %s: %s", series, e2)
         else:
             log.debug("[Tomorrow.io] %s: HTTP %s", series, r.status_code)
     except Exception as e:
@@ -1077,7 +1132,7 @@ def _fetch_noaa_daily(series: str, coords: dict) -> dict:
         # Step 1: get gridpoint
         r1 = requests.get(
             f'https://api.weather.gov/points/{lat:.4f},{lon:.4f}',
-            headers={'User-Agent': 'StrattonOakmont/1.0 stratton@example.com'},
+            headers={'User-Agent': 'the-firm/1.0 contact@example.com'},
             timeout=10
         )
         if r1.status_code != 200:
@@ -1089,7 +1144,7 @@ def _fetch_noaa_daily(series: str, coords: dict) -> dict:
         # Step 2: get forecast
         r2 = requests.get(
             forecast_url,
-            headers={'User-Agent': 'StrattonOakmont/1.0 stratton@example.com'},
+            headers={'User-Agent': 'the-firm/1.0 contact@example.com'},
             timeout=10
         )
         if r2.status_code != 200:
@@ -1200,6 +1255,7 @@ def fetch_daily_highs_consensus(series: str) -> tuple:
 def get_consensus_forecast(series: str, date: str) -> tuple:
     """
     Returns (forecast_high_f, uncertainty_f, agreement) for a given series + date.
+    CACHE-ONLY: never calls APIs directly. prefetch_all_forecasts() handles data fetching.
     agreement: 'HIGH' (<2F std), 'MEDIUM' (2-4F), 'LOW' (>4F or single model)
     """
     city = SERIES_CITY_MAP.get(series)
@@ -1208,38 +1264,17 @@ def get_consensus_forecast(series: str, date: str) -> tuple:
 
     temps = []
 
-    # Tomorrow.io (cached via fetch_daily_highs)
-    try:
-        t_data = _fetch_tomorrow_io_daily(series, city)
-        if t_data and date in t_data:
-            temps.append(t_data[date])
-    except Exception:
-        pass
+    # Tomorrow.io — read from memory cache only (never call API here)
+    t_key = "daily_%s" % series
+    t_cached = _forecast_mem_cache.get(t_key)
+    if t_cached and date in t_cached.get("data", {}):
+        temps.append(t_cached["data"][date])
 
-    # Open-Meteo — use prefetch cache first, fall back to live call
-    try:
-        om_key = "openmeteo_%s" % series
-        cached_om = _forecast_mem_cache.get(om_key)
-        if cached_om and date in cached_om.get("data", {}):
-            temps.append(cached_om["data"][date])
-        else:
-            # Try disk cache
-            o_data = None
-            try:
-                if os.path.exists(FORECAST_CACHE_FILE):
-                    with open(FORECAST_CACHE_FILE) as _f:
-                        _dc = json.load(_f)
-                    _entry = _dc.get(om_key, {})
-                    if (time.time() - _entry.get("ts", 0)) < TOMORROW_CACHE_TTL:
-                        o_data = _entry.get("data", {})
-                        if o_data:
-                            _forecast_mem_cache[om_key] = {"data": o_data, "ts": _entry["ts"]}
-            except Exception:
-                pass
-            if o_data and date in o_data:
-                temps.append(o_data[date])
-    except Exception:
-        pass
+    # Open-Meteo — read from memory cache only
+    om_key = "openmeteo_%s" % series
+    om_cached = _forecast_mem_cache.get(om_key)
+    if om_cached and date in om_cached.get("data", {}):
+        temps.append(om_cached["data"][date])
 
     if not temps:
         return None, 5.0, 'LOW'
@@ -1379,6 +1414,9 @@ def get_bias_corrected_forecast(series: str, date: str) -> tuple:
         log.debug("[Bias] %s %s: raw=%.1fF bias=%+.1fF corrected=%.1fF",
                   series, date, raw_high, bias, corrected)
 
+    # Apply ASOS real-time observation adjustment for today's markets
+    corrected, asos_source = get_asos_adjusted_forecast(series, date, corrected)
+
     return corrected, uncertainty, agreement, raw_high, bias
 
 
@@ -1406,8 +1444,9 @@ def uncertainty_for_date(date: str) -> float:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def execute_weather_trade(market: dict, direction: str, edge: float,
-                           model_prob: float, balance: float) -> dict:
-    """Place a limit order on a weather market. 3% of balance position sizing."""
+                           model_prob: float, balance: float,
+                           override_dollars: float = None) -> dict:
+    """Place a limit order on a weather market. Dynamic sizing based on daily budget."""
     ticker     = market.get("ticker", "")
     yes_bid    = float(market.get("yes_bid_dollars", 0) or 0)
     yes_ask    = float(market.get("yes_ask_dollars", 1) or 1)
@@ -1420,10 +1459,12 @@ def execute_weather_trade(market: dict, direction: str, edge: float,
         price_dollars = 1.0 - kalshi_mid
         side          = "no"
 
-    price_f   = max(price_dollars, 0.01)
-    price_c   = int(round(price_f * 100))
-    contracts = max(1, int(math.floor((balance * MAX_POSITION_PCT) / price_f)))
-    cost      = round(contracts * price_f, 2)
+    price_f = max(price_dollars, 0.01)
+    price_c = int(round(price_f * 100))
+    # Use override_dollars if provided (dynamic sizing), else fall back to pct
+    bet_dollars = override_dollars if override_dollars else (balance * MAX_POSITION_PCT)
+    contracts   = max(1, int(math.floor(bet_dollars / price_f)))
+    cost        = round(contracts * price_f, 2)
 
     client_order_id = "weather-%s" % uuid.uuid4()
     order_body = {
@@ -1798,7 +1839,7 @@ def llm_gate_check(ticker: str, city_name: str, direction: str,
     bias_note = (" (raw forecast adjusted by %+.1fF bias correction)" % bias_applied) if abs(bias_applied) >= 0.5 else ""
 
     prompt = (
-        "You are a weather market sanity checker for Stratton Oakmont. "
+        "You are a weather market sanity checker for The Firm. "
         "Review this paper trade signal and decide if it should be executed.\n\n"
         "Signal: %s | %s\n"
         "Direction: %s (betting the actual daily high will NOT be in the %s)\n"
@@ -1841,6 +1882,171 @@ def llm_gate_check(ticker: str, city_name: str, direction: str,
         return True, "timeout: %s" % str(e)[:40]
 
 
+def is_live_traded(ticker: str) -> bool:
+    """Check if ticker was already traded live today."""
+    today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    try:
+        if os.path.exists(LIVE_DEDUP_FILE):
+            with open(LIVE_DEDUP_FILE) as f:
+                data = json.load(f)
+            return ticker in data.get(today, [])
+    except Exception:
+        pass
+    return False
+
+
+def mark_live_traded(ticker: str):
+    """Mark ticker as traded live today."""
+    today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    try:
+        data = {}
+        if os.path.exists(LIVE_DEDUP_FILE):
+            with open(LIVE_DEDUP_FILE) as f:
+                data = json.load(f)
+        # Keep only today
+        data = {k: v for k, v in data.items() if k == today}
+        if today not in data:
+            data[today] = []
+        if ticker not in data[today]:
+            data[today].append(ticker)
+        with open(LIVE_DEDUP_FILE, 'w') as f:
+            json.dump(data, f)
+    except Exception as e:
+        log.warning("[LiveDedup] Save failed: %s", e)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DYNAMIC BET SIZING — daily budget spread across validated signals
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SPEND_FILE = os.path.join(DATA_DIR, "weather_daily_spend.json")
+
+
+def get_daily_spend() -> float:
+    """Return total spent on live trades today."""
+    today = datetime.now(ET).strftime('%Y-%m-%d')
+    try:
+        if os.path.exists(_SPEND_FILE):
+            with open(_SPEND_FILE) as f:
+                data = json.load(f)
+            return float(data.get(today, 0.0))
+    except Exception:
+        pass
+    return 0.0
+
+
+def record_daily_spend(amount: float):
+    """Add to today's spend total."""
+    today = datetime.now(ET).strftime('%Y-%m-%d')
+    try:
+        data = {}
+        if os.path.exists(_SPEND_FILE):
+            with open(_SPEND_FILE) as f:
+                data = json.load(f)
+        # Keep only today
+        data = {k: v for k, v in data.items() if k == today}
+        data[today] = data.get(today, 0.0) + amount
+        with open(_SPEND_FILE, 'w') as f:
+            json.dump(data, f)
+    except Exception as e:
+        log.warning("[Sizing] Spend record failed: %s", e)
+
+
+def calc_bet_size(balance: float, remaining_budget: float,
+                  remaining_signals: int) -> float:
+    """
+    Dynamic bet size: divide remaining budget evenly across remaining signals.
+    Clamped between MIN_BET_SIZE and MAX_BET_SIZE.
+    Never exceeds remaining_budget.
+    """
+    if remaining_signals <= 0 or remaining_budget <= 0:
+        return MIN_BET_SIZE
+    per_signal = remaining_budget / remaining_signals
+    return min(MAX_BET_SIZE, max(MIN_BET_SIZE, per_signal))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ASOS REAL-TIME OBSERVATIONS — live readings from exact settlement stations
+# ─────────────────────────────────────────────────────────────────────────────
+
+_asos_cache: dict = {}   # {station: {'temp_f': float, 'max_f': float, 'ts': float}}
+_ASOS_TTL = 600          # 10 min cache — ASOS updates hourly
+
+
+def fetch_asos_observation(series: str) -> dict:
+    """
+    Fetch latest ASOS observation from the exact NWS settlement station.
+    Returns {'current_f': float, 'max_f': float, 'ts': str} or {}.
+    Free, no key needed. Updates hourly at settlement station.
+    """
+    city = SERIES_CITY_MAP.get(series, {})
+    station = city.get('asos')
+    if not station:
+        return {}
+
+    now = time.time()
+    cached = _asos_cache.get(station)
+    if cached and (now - cached.get('cache_ts', 0)) < _ASOS_TTL:
+        return cached
+
+    try:
+        r = requests.get(
+            'https://api.weather.gov/stations/%s/observations/latest' % station,
+            headers={'User-Agent': 'the-firm/1.0'},
+            timeout=8,
+        )
+        if r.status_code == 200:
+            props = r.json().get('properties', {})
+            temp_c = props.get('temperature', {}).get('value')
+            max_c  = props.get('maxTemperatureLast24Hours', {}).get('value')
+            temp_f = round(temp_c * 9/5 + 32, 1) if temp_c is not None else None
+            max_f  = round(max_c * 9/5 + 32, 1) if max_c is not None else None
+            ts     = props.get('timestamp', '')[:16]
+            result = {'current_f': temp_f, 'max_f': max_f, 'ts': ts, 'station': station, 'cache_ts': now}
+            _asos_cache[station] = result
+            log.debug("[ASOS] %s (%s): current=%.1fF max24h=%s",
+                      series, station, temp_f or 0,
+                      '%.1fF' % max_f if max_f else 'N/A')
+            return result
+    except Exception as e:
+        log.debug("[ASOS] %s failed: %s", station, e)
+    return {}
+
+
+def get_asos_adjusted_forecast(series: str, date: str,
+                                forecast_high: float) -> tuple:
+    """
+    Combine model forecast with live ASOS observation.
+    If current ASOS temp > forecast, upgrade forecast.
+    If ASOS running max is available (24h), use that directly.
+    Returns (adjusted_forecast, asos_source) where source explains the adjustment.
+    """
+    obs = fetch_asos_observation(series)
+    if not obs:
+        return forecast_high, 'model_only'
+
+    today = datetime.now(ET).strftime('%Y-%m-%d')
+    if date != today:
+        return forecast_high, 'model_only'  # ASOS only useful for today's market
+
+    current = obs.get('current_f')
+    max24   = obs.get('max_f')
+
+    # If 24h max is available and higher than forecast, use it
+    if max24 and max24 > forecast_high:
+        log.debug("[ASOS] %s: upgrading forecast %.1fF -> %.1fF (24h max)", series, forecast_high, max24)
+        return max24, 'asos_max24h'
+
+    # If current temp exceeds forecast, upgrade
+    if current and current > forecast_high:
+        log.debug("[ASOS] %s: upgrading forecast %.1fF -> %.1fF (current obs)", series, forecast_high, current)
+        return current, 'asos_current'
+
+    return forecast_high, 'model_only'
+
+
+_scan_lock = __import__('threading').Lock()
+
 def run_weather_scan(dry_run: bool = False) -> dict:
     """
     Full weather scan: fetch markets → parse → get daily high forecasts
@@ -1853,11 +2059,10 @@ def run_weather_scan(dry_run: bool = False) -> dict:
     # ── 0a. Prefetch forecasts if near model update window ───────────────────
     try:
         last_pf = _last_prefetch_time()
-        if _near_prefetch_window() and (time.time() - last_pf) > 1800:
+        if _near_prefetch_window() and (time.time() - last_pf) > 7200:
             log.info("[Scan] Near model update window — triggering prefetch")
             prefetch_all_forecasts()
         elif (time.time() - last_pf) > TOMORROW_CACHE_TTL:
-            # Safety: if cache is older than TTL, prefetch regardless of window
             log.info("[Scan] Cache stale (%.0fh) — triggering prefetch",
                      (time.time() - last_pf) / 3600)
             prefetch_all_forecasts()
@@ -2180,11 +2385,42 @@ def run_weather_scan(dry_run: bool = False) -> dict:
                          n_open, MAX_ACTIVE_WEATHER_ORDERS)
                 break
 
+            # Live dedup — never fire the same ticker twice in one day
+            if is_live_traded(ticker):
+                log.debug("[Live] Already traded %s today — skipping", ticker)
+                continue
+
+            # LLM gate — veto blocks live execution
+            live_gate_ok, live_gate_reason = llm_gate_check(
+                ticker=ticker, city_name=city_name, direction=direction,
+                forecast_high=forecast_high, uncertainty=uncertainty,
+                kalshi_mid=kalshi_mid, model_prob=model_prob, edge=edge,
+                strike_type=parsed.get("strike_type", ""),
+                threshold=parsed.get("threshold"),
+                low=parsed.get("low"), high=parsed.get("high"),
+                bias_applied=fc_bias if "fc_bias" in dir() else 0.0)
+            if not live_gate_ok and LLM_GATE_VETO_IN_LIVE:
+                log.info("[Gate] LIVE VETO: %s — %s", ticker, live_gate_reason)
+                continue
+
+            # Dynamic sizing
+            _remaining_budget = max(0, DAILY_LIVE_BUDGET - get_daily_spend())
+            _remaining_signals = len([c for c in candidates[candidates.index(
+                (abs_edge, edge, market, parsed, model_prob,
+                 kalshi_mid, forecast_high, uncertainty, direction)):]])
+            _bet_size = calc_bet_size(balance, _remaining_budget, max(1, _remaining_signals))
+            if _remaining_budget < MIN_BET_SIZE:
+                log.info("[Sizing] Daily budget exhausted ($%.2f spent) — stopping", get_daily_spend())
+                break
+
             try:
-                result = execute_weather_trade(market, direction, edge, model_prob, balance)
+                result = execute_weather_trade(market, direction, edge, model_prob, balance,
+                                              override_dollars=_bet_size)
                 if result.get("status") not in ("failed",):
                     summary["trades"] += 1
                     n_open += 1
+                    mark_live_traded(ticker)
+                    record_daily_spend(result.get("cost", 0.0))
                     msg = format_live_msg(ticker, parsed, direction, edge, model_prob,
                                          kalshi_mid, forecast_high, result)
                     post_discord(msg, dry_run=False)
@@ -2239,7 +2475,7 @@ def run_weather_scan(dry_run: bool = False) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_scan(post=None, **kwargs):
-    """Entry point for firm.py orchestrator. LIVE MODE - approved 2026-04-27."""
+    """Entry point for firm.py orchestrator. LIVE MODE - gate+dedup fixes applied 2026-04-29."""
     result = run_weather_scan(dry_run=False)
     try:
         import sys as _sys
