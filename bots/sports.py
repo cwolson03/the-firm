@@ -67,7 +67,7 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 SPORTS_PAPER_MODE = True  # paper mode — flip to False when ready for live sports  # Set to False only when Cody explicitly authorizes live trading
 
 KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
-KEY_ID      = ""  # set via KALSHI_KEY_ID env var
+KEY_ID      = "2e462103-bdd5-4a1b-b231-17191bded0bb"
 
 # Paths — auto-detect Atlas (cody) vs local (stratton)
 if os.path.exists("/home/cody/stratton"):

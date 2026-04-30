@@ -65,7 +65,7 @@ else:
     WEATHER_PY_PATH  = "/home/stratton/.openclaw/workspace/research/weather.py"
 
 KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
-KEY_ID      = ""  # set via KALSHI_KEY_ID env var
+KEY_ID      = "2e462103-bdd5-4a1b-b231-17191bded0bb"
 
 GENERAL_CHANNEL = 1491861935354810453   # #general
 ALERT_COOLDOWN_HOURS = 2                # don't repeat the same alert within 2 hours

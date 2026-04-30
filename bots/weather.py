@@ -55,12 +55,12 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 # ─────────────────────────────────────────────────────────────────────────────
 
 if os.path.exists("/home/cody/stratton"):
-    PRIVATE_KEY_PATH  = "/home/cody/stratton/config/kalshi_private.pem"
+    PRIVATE_KEY_PATH  = os.environ.get("KALSHI_KEY_PATH", "")
     BOT_TOKENS_ENV    = "/home/cody/stratton/config/bot-tokens.env"
     LOG_PATH          = "/home/cody/stratton/logs/weather.log"
     DATA_DIR          = "/home/cody/stratton/data"
 else:
-    PRIVATE_KEY_PATH  = "/home/stratton/.openclaw/workspace/config/kalshi_private.pem"
+    PRIVATE_KEY_PATH  = os.environ.get("KALSHI_KEY_PATH", "")
     BOT_TOKENS_ENV    = "/home/stratton/.openclaw/workspace/config/bot-tokens.env"
     LOG_PATH          = "/home/stratton/.openclaw/workspace/logs/weather.log"
     DATA_DIR          = "/home/stratton/.openclaw/workspace/data"
@@ -89,9 +89,9 @@ BIAS_MIN_SAMPLES          = 3     # minimum samples before applying correction
 # ─────────────────────────────────────────────────────────────────────────────
 
 KALSHI_BASE      = "https://api.elections.kalshi.com/trade-api/v2"
-KEY_ID           = ""  # set via KALSHI_KEY_ID env var
-TOMORROW_API_KEY         = os.environ.get("TOMORROW_API_KEY", ""  # set via TOMORROW_API_KEY env var)  # primary (clean)
-TOMORROW_API_KEY_FALLBACK = os.environ.get("TOMORROW_API_KEY_FALLBACK", ""  # rotate at tomorrow.io)  # secondary (exposed, use if primary exhausted)
+KEY_ID           = "2e462103-bdd5-4a1b-b231-17191bded0bb"
+TOMORROW_API_KEY         = os.environ.get("TOMORROW_API_KEY", "69f23a4a8a974476bdb0dc3e")  # primary (clean)
+TOMORROW_API_KEY_FALLBACK = os.environ.get("TOMORROW_API_KEY_FALLBACK", "ojJ8eI5GY3gaGHwXkvtHoA5sE0rygpGz")  # secondary (exposed, use if primary exhausted)
 
 # Discord — #mark-signals
 WEATHER_CHANNEL = 1491861985162432634
@@ -2385,10 +2385,11 @@ def run_weather_scan(dry_run: bool = False) -> dict:
                          n_open, MAX_ACTIVE_WEATHER_ORDERS)
                 break
 
-            # Live dedup — never fire the same ticker twice in one day
+            # Live dedup — claim the ticker BEFORE gate check to prevent race condition
             if is_live_traded(ticker):
                 log.debug("[Live] Already traded %s today — skipping", ticker)
                 continue
+            mark_live_traded(ticker)  # claim immediately — gate may still veto but no double-fire
 
             # LLM gate — veto blocks live execution
             live_gate_ok, live_gate_reason = llm_gate_check(
@@ -2401,7 +2402,7 @@ def run_weather_scan(dry_run: bool = False) -> dict:
                 bias_applied=fc_bias if "fc_bias" in dir() else 0.0)
             if not live_gate_ok and LLM_GATE_VETO_IN_LIVE:
                 log.info("[Gate] LIVE VETO: %s — %s", ticker, live_gate_reason)
-                continue
+                continue  # dedup claimed but not executed — prevents retry today
 
             # Dynamic sizing
             _remaining_budget = max(0, DAILY_LIVE_BUDGET - get_daily_spend())
@@ -2419,7 +2420,7 @@ def run_weather_scan(dry_run: bool = False) -> dict:
                 if result.get("status") not in ("failed",):
                     summary["trades"] += 1
                     n_open += 1
-                    mark_live_traded(ticker)
+                    # mark_live_traded already called above before gate
                     record_daily_spend(result.get("cost", 0.0))
                     msg = format_live_msg(ticker, parsed, direction, edge, model_prob,
                                          kalshi_mid, forecast_high, result)
