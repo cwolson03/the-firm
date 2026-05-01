@@ -257,6 +257,46 @@ export default function EconomicsTab() {
 
         {/* Trade history */}
         <div className="border border-[#222] rounded-lg bg-[#111] p-4">
+          {/* Resolved P&L summary */}
+          {(() => {
+            const resolved = econEvals.filter(e => e.outcome === 'WIN' || e.outcome === 'LOSS')
+            const wins = resolved.filter(e => e.outcome === 'WIN')
+            // Use real pnl_dollars where available, fall back to estimated
+            const totalGain = resolved.reduce((s, e) => {
+              const pnlD = (e as unknown as Record<string, number>).pnl_dollars
+              if (typeof pnlD === 'number' && pnlD !== 0) return s + pnlD
+              // Fallback estimate: avg $18 per trade
+              return s + (e.pnl_pct / 100) * 18
+            }, 0)
+            const winRate = resolved.length > 0 ? wins.length / resolved.length * 100 : 0
+            if (resolved.length === 0) return null
+            return (
+              <div className="grid grid-cols-4 gap-3 mb-4 pb-4 border-b border-[#1a1a1a]">
+                <div className="text-center">
+                  <p className="text-[#888] text-[10px] mb-1">Resolved</p>
+                  <p className="text-xl font-bold text-[#e5e5e5]">{resolved.length}</p>
+                </div>
+                <div className="text-center">
+                  <p className="text-[#888] text-[10px] mb-1">Win Rate</p>
+                  <p className="text-xl font-bold" style={{ color: winRate >= 50 ? '#00ff88' : '#ff4444' }}>
+                    {winRate.toFixed(0)}%
+                  </p>
+                </div>
+                <div className="text-center">
+                  <p className="text-[#888] text-[10px] mb-1">Est. Total Gain</p>
+                  <p className="text-xl font-bold" style={{ color: totalGain >= 0 ? '#00ff88' : '#ff4444' }}>
+                    {totalGain >= 0 ? '+' : ''}${totalGain.toFixed(0)}
+                  </p>
+                </div>
+                <div className="text-center">
+                  <p className="text-[#888] text-[10px] mb-1">Avg P&L</p>
+                  <p className="text-xl font-bold" style={{ color: totalGain >= 0 ? '#00ff88' : '#ff4444' }}>
+                    {resolved.length > 0 ? `${(resolved.reduce((s,e)=>s+e.pnl_pct,0)/resolved.length) >= 0 ? '+' : ''}${(resolved.reduce((s,e)=>s+e.pnl_pct,0)/resolved.length).toFixed(0)}%` : '—'}
+                  </p>
+                </div>
+              </div>
+            )
+          })()}
           <div className="flex items-center justify-between mb-3">
             <div className="flex items-center gap-2">
               <h2 className="text-sm font-medium text-[#e5e5e5]">Trade History</h2>

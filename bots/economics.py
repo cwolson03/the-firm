@@ -46,11 +46,11 @@ KEY_ID      = "2e462103-bdd5-4a1b-b231-17191bded0bb"
 # Paths — auto-detect Atlas (cody) vs local (stratton)
 _HOME = os.path.expanduser("~")
 if os.path.exists("/home/cody/stratton"):
-    PRIVATE_KEY_PATH = os.environ.get("KALSHI_KEY_PATH", "")
+    PRIVATE_KEY_PATH = "/home/cody/stratton/config/kalshi_private.pem"
     BOT_TOKENS_ENV   = "/home/cody/stratton/config/bot-tokens.env"
     LOG_PATH         = "/home/cody/stratton/logs/economics.log"
 else:
-    PRIVATE_KEY_PATH = os.environ.get("KALSHI_KEY_PATH", "")
+    PRIVATE_KEY_PATH = "/home/stratton/.openclaw/workspace/config/kalshi_private.pem"
     BOT_TOKENS_ENV   = "/home/stratton/.openclaw/workspace/config/bot-tokens.env"
     LOG_PATH         = "/home/stratton/.openclaw/workspace/logs/economics.log"
 
@@ -146,7 +146,40 @@ def _get_active_thesis_locks() -> dict:
         except Exception:
             pass
         active[ticker] = lock_data
+    # Merge dynamic locks built from live model each cycle
+    active.update(_dynamic_thesis_locks)
     return active
+
+
+# Runtime dynamic thesis locks — rebuilt each scan cycle
+_dynamic_thesis_locks: dict = {}
+
+def build_thesis_locks() -> dict:
+    """
+    Dynamically build thesis direction locks from live GDPNow model.
+    Fetches open KXGDP markets and locks direction based on GDPNow vs threshold.
+    Called at start of each run_scan() cycle.
+    Returns {ticker: direction} dict.
+    """
+    locks = {}
+    gdpnow = fetch_gdpnow_realtime()
+    if gdpnow is None:
+        return locks
+    try:
+        data = kalshi_get("/markets", {"series_ticker": "KXGDP", "status": "open", "limit": 50})
+        for m in data.get("markets", []):
+            ticker = m.get("ticker", "")
+            match = re.search(r"T(-?\d+\.?\d*)", ticker.upper())
+            if not match:
+                continue
+            threshold = float(match.group(1))
+            direction = "NO" if gdpnow < threshold else "YES"
+            locks[ticker] = direction
+            log.info("[THESIS] Auto-lock: %s -> %s (GDPNow=%.2f%% vs thr=%.2f%%)",
+                     ticker, direction, gdpnow, threshold)
+    except Exception as e:
+        log.warning("[THESIS] GDP lock build failed: %s", e)
+    return locks
 
 # Stop-loss config for open positions
 STOP_LOSS_RULES = {
@@ -176,7 +209,7 @@ ECONOMIC_CALENDAR = [
     ('2026-04-29', 'GDP Q1 Advance', 'KXGDP'),
     ('2026-04-30', 'PCE March',      'KXPCE'),
     ('2026-04-30', 'FOMC Decision',  'KXFEDMEET'),
-    ('2026-05-02', 'NFP April',      'KXNFP'),
+    ('2026-05-02', 'NFP April',      'KXPAYROLLS'),  # ticker prefix corrected from KXNFP
     ('2026-05-13', 'CPI April',      'KXCPI'),
     # Daily crypto markets refresh continuously — always check
     ('daily', 'BTC Daily Price', 'KXBTCD'),
@@ -718,6 +751,183 @@ def calculate_cpi_edge(ticker: str, kalshi_mid: float) -> tuple:
         model_prob_yes = min(0.95, 0.5 + gap * 0.12)
         edge = model_prob_yes - kalshi_mid
         return model_prob_yes, edge, "YES", f"ClevFed={model_cpi:.2f}%>{threshold}%"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NFP MODEL — Nonfarm Payrolls edge calculator
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fetch_adp_estimate() -> dict:
+    """
+    Fetch ADP National Employment Report from FRED (ADPWNFM series).
+    ADP releases ~2 days before NFP and is a strong leading signal.
+    Returns dict: value (thousands), date, available (bool)
+    """
+    try:
+        r = requests.get("https://api.stlouisfed.org/fred/series/observations", params={
+            "series_id": "ADPWNFM",
+            "api_key": FRED_API_KEY,
+            "file_type": "json",
+            "sort_order": "desc",
+            "limit": 3,
+        }, timeout=10)
+        if r.ok:
+            obs = [(o["date"], float(o["value"])) for o in r.json().get("observations", [])
+                   if o.get("value") not in (".", None)]
+            if obs:
+                log.info("[NFP] ADP latest: %.0fK (as of %s)", obs[0][1], obs[0][0])
+                return {"value": obs[0][1], "date": obs[0][0], "available": True}
+    except Exception as e:
+        log.debug("[NFP] ADP fetch failed: %s", e)
+    return {"value": None, "date": None, "available": False}
+
+def fetch_nfp_estimate() -> dict:
+    """
+    Build an NFP model estimate using FRED PAYEMS trend data.
+
+    Model:
+      - 3-month average of MoM PAYEMS changes → near-term trend
+      - 6-month average → longer-term baseline
+      - Blend: 70% 3-month, 30% 6-month
+      - Uncertainty band: ±75K (NFP has historically high revision noise)
+
+    Returns dict with keys: estimate, std_dev, trend_3m, trend_6m, last_reading, source
+    """
+    try:
+        import requests as _req
+        r = _req.get("https://api.stlouisfed.org/fred/series/observations", params={
+            "series_id": "PAYEMS",
+            "api_key": FRED_API_KEY,
+            "file_type": "json",
+            "sort_order": "desc",
+            "limit": 8,
+        }, timeout=10)
+        if not r.ok:
+            return {}
+        obs = [(o["date"], float(o["value"])) for o in r.json().get("observations", [])
+               if o.get("value") != "."]
+        if len(obs) < 4:
+            return {}
+
+        # MoM changes (thousands)
+        changes = [obs[i][1] - obs[i+1][1] for i in range(len(obs)-1)]
+
+        trend_3m = sum(changes[:3]) / 3
+        trend_6m = sum(changes[:6]) / 6 if len(changes) >= 6 else trend_3m
+
+        # Blended estimate: 70% recent, 30% longer-term
+        estimate = round(trend_3m * 0.70 + trend_6m * 0.30, 0)
+
+        # Blend with ADP if available
+        adp = fetch_adp_estimate()
+        adp_blended = False
+        std_dev = 75000
+        if adp["available"] and adp["value"] is not None:
+            adp_k = adp["value"]
+            estimate = round(estimate * 0.60 + adp_k * 0.40, 0)
+            std_dev  = 60000
+            adp_blended = True
+            log.info("[NFP] ADP blend: base=%.0fK ADP=%.0fK -> blended=%.0fK sigma=60K",
+                     trend_3m * 0.70 + trend_6m * 0.30, adp_k, estimate)
+        result = {
+            "estimate":     estimate,
+            "std_dev":      std_dev,
+            "trend_3m":     round(trend_3m, 0),
+            "trend_6m":     round(trend_6m, 0),
+            "last_reading": changes[0],
+            "last_date":    obs[0][0],
+            "adp_value":    adp.get("value"),
+            "adp_blended":  adp_blended,
+            "source":       "FRED/PAYEMS+ADP" if adp_blended else "FRED/PAYEMS",
+        }
+        log.info("[NFP] Estimate: %.0fK (3m=%.0fK 6m=%.0fK adp=%s src=%s)",
+            estimate, trend_3m, trend_6m,
+            "%.0fK" % adp["value"] if adp["available"] else "N/A", result["source"])
+        return result
+    except Exception as e:
+        log.warning("[NFP] fetch_nfp_estimate failed: %s", e)
+        return {}
+
+# Cache NFP estimate — refresh every 4 hours
+_nfp_cache: dict = {}
+_nfp_cache_ts: float = 0.0
+
+def get_nfp_estimate() -> dict:
+    """Cached wrapper around fetch_nfp_estimate."""
+    global _nfp_cache, _nfp_cache_ts
+    now = time.time()
+    if _nfp_cache and (now - _nfp_cache_ts) < 14400:  # 4-hour cache
+        return _nfp_cache
+    result = fetch_nfp_estimate()
+    if result:
+        _nfp_cache = result
+        _nfp_cache_ts = now
+    return _nfp_cache
+
+def calculate_nfp_edge(ticker: str, kalshi_mid: float) -> tuple:
+    """
+    Edge calculation for KXPAYROLLS markets.
+
+    Approach:
+      - Model estimate from PAYEMS 3/6-month blended trend
+      - Normal distribution with std_dev=75K to compute P(actual > threshold)
+      - Compare to Kalshi mid price
+      - Direction: YES if model_prob > kalshi_mid, NO if model_prob < kalshi_mid
+
+    Guardrails enforced here (in addition to should_execute):
+      - Do not execute if estimate is within 1 std_dev of threshold (edge too thin)
+      - Only return valid edge if |model_prob - kalshi_mid| >= EXEC_MIN_EDGE_DOLLARS
+
+    Returns: (model_prob, edge, direction, source)
+    """
+    try:
+        from scipy.stats import norm as _norm_check
+    except ImportError:
+        log.warning("[NFP] scipy unavailable -- cannot calculate NFP edge")
+        return None, 0.0, "NO", "scipy_unavailable"
+
+    ticker_upper = ticker.upper()
+
+    # Extract threshold from ticker e.g. KXPAYROLLS-26APR-T175000 → 175000
+    # Handles negative thresholds: T-100000 → -100000
+    match = re.search(r"T(-?\d+)", ticker_upper)
+    if not match:
+        return None, 0.0, "NO", "parse_error"
+    threshold = float(match.group(1))
+
+    nfp = get_nfp_estimate()
+    if not nfp:
+        return None, 0.0, "NO", "unavailable"
+
+    # UNITS: PAYEMS MoM changes come from FRED in thousands (52.0 = 52K jobs).
+    # Ticker threshold is full number (T150000 = 150,000 jobs).
+    # Normalize everything to full job counts for z-score.
+    estimate_full  = nfp["estimate"] * 1000   # 52.0 -> 52,000
+    std_dev_full   = nfp["std_dev"]           # 75,000 (already full units)
+    threshold_full = threshold                # from ticker regex: already full number
+
+    # P(actual > threshold) using normal distribution
+    from scipy.stats import norm
+    z = (threshold_full - estimate_full) / std_dev_full
+    model_prob = float(1.0 - norm.cdf(z))  # P(X > threshold)
+
+    edge = model_prob - kalshi_mid
+    direction = "YES" if edge > 0 else "NO"
+
+    # Thin-edge guard: if estimate is within 1 std_dev of threshold, flag it
+    if abs(estimate_full - threshold_full) < std_dev_full:
+        log.info(
+            "[NFP] %s: estimate=%.0fK threshold=%.0fK -- within 1-sigma (75K), edge unreliable -- min_edge filter will gate",
+            ticker, estimate_full/1000, threshold_full/1000
+        )
+
+    log.info(
+        "[NFP] %s: model_est=%.0fK thr=%.0fK sigma=75K -> P(>thr)=%.0f%% kalshi=%.0f%% edge=%+.2f -> %s",
+        ticker, estimate_full/1000, threshold_full/1000, model_prob*100, kalshi_mid*100, edge, direction
+    )
+
+    source = "PAYEMS_trend(%.0fK+/-75K)" % (estimate_full/1000)
+    return model_prob, edge, direction, source
 
 def calculate_gdp_edge(ticker: str, kalshi_mid: float) -> tuple:
     """Returns (model_prob, edge, direction, source) for GDP markets."""
@@ -1444,6 +1654,30 @@ def score_and_rank_markets(
                     play["composite"] = play.get("composite", 0) + abs(econ_edge) * tier_mult
                 log.info(f"[Cleveland] {ticker}: model={model_prob:.0%} kalshi={mid:.0%} edge={econ_edge:+.2f} → {econ_dir} ({econ_src})")
 
+        # FOMC edge calculator for KXFEDDECISION markets
+        if market_class == "ECONOMIC_DATA" and ticker.upper().startswith('KXFEDDECISION'):
+            model_prob, econ_edge, econ_dir, econ_src = calculate_fomc_edge(ticker, mid)
+            if model_prob is not None:
+                play["econ_edge"] = round(econ_edge, 3)
+                play["econ_direction"] = econ_dir
+                play["econ_source"] = econ_src
+                play["direction"] = econ_dir
+                if abs(econ_edge) > 0.10:
+                    play["composite"] = play.get("composite", 0) + abs(econ_edge) * tier_mult
+                log.info(f"[FOMC] {ticker}: model={model_prob:.0%} kalshi={mid:.0%} edge={econ_edge:+.2f} -> {econ_dir} ({econ_src})")
+
+        # NFP edge calculator for KXPAYROLLS markets
+        if market_class == "ECONOMIC_DATA" and ticker.upper().startswith('KXPAYROLLS'):
+            model_prob, econ_edge, econ_dir, econ_src = calculate_nfp_edge(ticker, mid)
+            if model_prob is not None:
+                play["econ_edge"] = round(econ_edge, 3)
+                play["econ_direction"] = econ_dir
+                play["econ_source"] = econ_src
+                play["direction"] = econ_dir
+                if abs(econ_edge) > 0.10:
+                    play["composite"] = play.get("composite", 0) + abs(econ_edge) * tier_mult
+                log.info(f"[NFP] {ticker}: model_prob={model_prob:.0%} kalshi={mid:.0%} edge={econ_edge:+.2f} → {econ_dir} ({econ_src})")
+
         # Crypto edge calculator for KXBTCD/KXETHD daily price range markets
         if market_class == 'CRYPTO_SHORT' and ('KXBTCD' in ticker.upper() or 'KXETHD' in ticker.upper()):
             model_prob, econ_edge, econ_dir, econ_src = calculate_crypto_edge(ticker, mid)
@@ -2075,13 +2309,14 @@ def run_execution_check(plays: list, dry_run: bool = False):
                         from eval_framework import log_trade_entry as _ef_log
                         _ef_log(
                             trade_id=signal.get('ticker', 'unknown'),
-                            agent='donnie',
+                            agent='economics',
                             market=signal.get('ticker', 'unknown'),
                             direction=signal.get('direction', 'YES'),
                             entry_edge_pct=abs(signal.get('edge_dollars', 0)) * 100,
                             llm_confidence=str(signal.get('confidence', '')),
                             raw_thesis=f"mid={signal.get('mid_c', 0)}c model_prob={signal.get('model_prob', 0):.3f}",
                             raw_llm_reason=signal.get('llm_reason', '')[:500] if signal.get('llm_reason') else '',
+                            exposure_dollars=round(signal.get('contracts', 1) * (signal.get('mid_c', 50) / 100), 2),
                         )
                     except Exception:
                         pass  # eval logging never blocks execution
@@ -2361,7 +2596,7 @@ def run_realtime_monitor(dry_run: bool = False):
                             from eval_framework import log_trade_entry as _ef_log2
                             _ef_log2(
                                 trade_id=play.get('ticker', 'unknown'),
-                                agent='donnie',
+                                agent='economics',
                                 market=play.get('ticker', 'unknown'),
                                 direction=play.get('direction', 'YES'),
                                 entry_edge_pct=abs(play.get('edge_dollars', 0)) * 100,
@@ -2705,6 +2940,159 @@ def fetch_fedwatch_hold_prob() -> float:
         log.debug(f"[EconModel] FedWatch fetch failed: {e}")
     return 0.95  # fallback: assume ~95% hold
 
+def fetch_fed_rate_data() -> dict:
+    """
+    Fetch current Fed funds target rate and SOFR forward rate from FRED.
+    Used as inputs for FOMC probability model.
+    Returns dict: current_upper, current_lower, sofr_90d, implied_forward_rate
+    """
+    try:
+        upper = fetch_fred_series("DFEDTARU")   # Upper bound of target range
+        lower = fetch_fred_series("DFEDTARL")   # Lower bound
+        sofr  = fetch_fred_series("SOFR90DAYAVG")  # 90-day SOFR avg (forward-looking)
+        dff   = fetch_fred_series("DFF")         # Effective Fed funds rate (spot)
+        result = {
+            "upper":    upper or 3.75,
+            "lower":    lower or 3.50,
+            "midpoint": ((upper or 3.75) + (lower or 3.50)) / 2,
+            "sofr_90d": sofr,
+            "dff":      dff,
+        }
+        log.info("[FOMC] Rate data: upper=%.2f lower=%.2f SOFR_90d=%s DFF=%s",
+                 result["upper"], result["lower"], sofr, dff)
+        return result
+    except Exception as e:
+        log.warning("[FOMC] fetch_fed_rate_data failed: %s", e)
+        return {"upper": 3.75, "lower": 3.50, "midpoint": 3.625, "sofr_90d": None, "dff": None}
+
+# Cache fed rate data — refresh every 4 hours
+_fed_rate_cache: dict = {}
+_fed_rate_cache_ts: float = 0.0
+
+def get_fed_rate_data() -> dict:
+    global _fed_rate_cache, _fed_rate_cache_ts
+    now = time.time()
+    if _fed_rate_cache and (now - _fed_rate_cache_ts) < 14400:
+        return _fed_rate_cache
+    result = fetch_fed_rate_data()
+    if result:
+        _fed_rate_cache = result
+        _fed_rate_cache_ts = now
+    return _fed_rate_cache
+
+def calculate_fomc_edge(ticker: str, kalshi_mid: float) -> tuple:
+    """
+    Edge calculation for KXFEDDECISION markets.
+
+    Ticker format: KXFEDDECISION-{YY}{MON}-{ACTION}
+    Actions:
+      C25  = cut 25bps
+      C26+ = cut >25bps
+      H0   = hold (0bps change)
+      H25  = hike 25bps
+      H26+ = hike >25bps
+
+    Model:
+      Uses SOFR 90-day avg vs current Fed funds target to infer market expectation.
+      SOFR_90d below current rate midpoint implies cuts are priced in.
+      Gap between SOFR and current rate scales cut/hold/hike probabilities.
+
+    Fallback: if SOFR unavailable, use DFF spread vs target.
+
+    Returns: (model_prob, edge, direction, source)
+    """
+    ticker_upper = ticker.upper()
+
+    # Parse action from ticker
+    action = None
+    if ticker_upper.endswith('-C25'):   action = 'cut25'
+    elif ticker_upper.endswith('-C26'): action = 'cutmore'
+    elif '-C25' in ticker_upper:       action = 'cut25'
+    elif '-H0' in ticker_upper:        action = 'hold'
+    elif '-H25' in ticker_upper:       action = 'hike25'
+    elif '-H26' in ticker_upper:       action = 'hikemore'
+    elif 'HOLD' in ticker_upper or 'UNCHANGED' in ticker_upper: action = 'hold'
+    elif 'EMERGENCY' in ticker_upper:  action = 'emergency'
+    elif 'KXFEDMEET' in ticker_upper:  action = 'emergency'  # KXFEDMEET = emergency meeting markets
+
+    if action is None:
+        log.debug("[FOMC] Cannot parse action from ticker: %s", ticker)
+        return None, 0.0, "NO", "parse_error"
+
+    rates = get_fed_rate_data()
+    midpoint   = rates["midpoint"]    # e.g. 3.625%
+    sofr_90d   = rates["sofr_90d"]    # e.g. 3.67% (from FRED)
+    dff        = rates["dff"]         # effective daily rate
+
+    # Forward rate signal: SOFR_90d vs midpoint
+    # SOFR_90d > midpoint -> market expects no cut (rates staying up)
+    # SOFR_90d < midpoint -> cuts priced in
+    if sofr_90d is not None:
+        rate_signal = sofr_90d - midpoint  # positive = market says rates staying/rising
+        forward_source = "SOFR_90d=%.2f vs target=%.3f" % (sofr_90d, midpoint)
+    elif dff is not None:
+        rate_signal = dff - midpoint
+        forward_source = "DFF=%.2f vs target=%.3f" % (dff, midpoint)
+    else:
+        rate_signal = 0.10  # conservative fallback: slight hold bias
+        forward_source = "fallback"
+
+    # Convert rate signal to probabilities
+    # signal > +0.10: strong hold/hike signal
+    # signal near 0: uncertain
+    # signal < -0.10: cut expected
+    cut_prob  = max(0.02, min(0.95, 0.50 - rate_signal * 3.0))
+    hold_prob = max(0.02, min(0.95, 0.50 + rate_signal * 2.0))
+    hike_prob = max(0.01, min(0.95, rate_signal * 2.0))
+
+    # Normalize
+    total = cut_prob + hold_prob + hike_prob
+    cut_prob  /= total
+    hold_prob /= total
+    hike_prob /= total
+
+    # Select model_prob for this market's action
+    if action == 'cut25':
+        model_prob = cut_prob * 0.8   # 25bps specifically (vs >25bps)
+    elif action == 'cutmore':
+        model_prob = cut_prob * 0.2
+    elif action == 'hold':
+        model_prob = hold_prob
+    elif action == 'hike25':
+        model_prob = hike_prob * 0.7
+    elif action == 'hikemore':
+        model_prob = hike_prob * 0.3
+    elif action == 'emergency':
+        # Emergency meeting: very low probability baseline
+        model_prob = 0.05
+    else:
+        return None, 0.0, "NO", "unknown_action"
+
+    model_prob = round(float(model_prob), 3)
+    edge = model_prob - kalshi_mid
+    direction = "YES" if edge > 0 else "NO"
+
+    log.info("[FOMC] %s: action=%s rate_signal=%+.3f cut=%.0f%% hold=%.0f%% hike=%.0f%% "
+             "-> model=%.0f%% kalshi=%.0f%% edge=%+.2f %s",
+             ticker, action, rate_signal, cut_prob*100, hold_prob*100, hike_prob*100,
+             model_prob*100, kalshi_mid*100, edge, direction)
+
+    source = "SOFR_model(%s)" % forward_source
+    return model_prob, edge, direction, source
+
+def fetch_fedwatch_hold_prob() -> float:
+    """Legacy wrapper — returns hold probability from new FOMC model."""
+    rates = get_fed_rate_data()
+    midpoint = rates.get("midpoint", 3.625)
+    sofr = rates.get("sofr_90d")
+    if sofr is not None:
+        rate_signal = sofr - midpoint
+        hold_prob = max(0.05, min(0.95, 0.50 + rate_signal * 2.0))
+    else:
+        hold_prob = 0.92   # current default: Fed on hold
+    log.info("[FOMC] hold_prob=%.2f (legacy fedwatch_hold_prob)", hold_prob)
+    return hold_prob
+
 def calculate_economic_edge(ticker: str, kalshi_mid: float) -> tuple:
     """
     For a given economic market ticker, fetch the relevant model estimate
@@ -2714,37 +3102,17 @@ def calculate_economic_edge(ticker: str, kalshi_mid: float) -> tuple:
     """
     ticker_upper = ticker.upper()
 
-    # GDP markets: KXGDP-26APR30-T{threshold}
-    if 'KXGDP' in ticker_upper and 'APR30' in ticker_upper:
-        gdpnow = fetch_gdpnow_realtime()
-        if gdpnow is None:
-            return None, 0.0, "NO", "unavailable"
+    # GDP markets: any KXGDP ticker — generalized (not just APR30)
+    if 'KXGDP' in ticker_upper:
+        return calculate_gdp_edge(ticker, kalshi_mid)
 
-        # Extract threshold from ticker
-        match = re.search(r'T(-?\d+\.?\d*)', ticker_upper)
-        if not match:
-            return None, 0.0, "NO", "parse_error"
-        threshold = float(match.group(1))
+    # NFP/Payrolls markets
+    if 'KXPAYROLLS' in ticker_upper:
+        return calculate_nfp_edge(ticker, kalshi_mid)
 
-        # If GDPNow < threshold: NO is likely to win
-        if gdpnow < threshold:
-            # How confident? Bigger gap = more confident
-            gap = threshold - gdpnow
-            model_prob_no = min(0.95, 0.5 + gap * 0.15)  # 0.5 at gap=0, up to 0.95
-            edge = model_prob_no - (1.0 - kalshi_mid)     # edge on NO = our_prob - kalshi_no_prob
-            return model_prob_no, edge, "NO", f"GDPNow={gdpnow:.1f}%<{threshold}%"
-        else:
-            gap = gdpnow - threshold
-            model_prob_yes = min(0.95, 0.5 + gap * 0.15)
-            edge = model_prob_yes - kalshi_mid
-            return model_prob_yes, edge, "YES", f"GDPNow={gdpnow:.1f}%>{threshold}%"
-
-    # FOMC markets
+    # FOMC markets — full decision model (cut/hold/hike)
     if 'KXFEDMEET' in ticker_upper or 'KXFEDDECISION' in ticker_upper:
-        hold_prob = fetch_fedwatch_hold_prob()
-        if 'HOLD' in ticker_upper or 'UNCHANGED' in ticker_upper:
-            edge = hold_prob - kalshi_mid
-            return hold_prob, edge, "YES" if edge > 0 else "NO", "CME_FedWatch"
+        return calculate_fomc_edge(ticker, kalshi_mid)
 
     return None, 0.0, "NO", "no_model"
 
@@ -2899,8 +3267,68 @@ def main():
 
         time.sleep(5)
 
+
+def check_pre_release_briefs(dry_run: bool = False):
+    """
+    Post pre-release briefs to #donnie-results for economic releases within 24 hours.
+    Called once per run_scan() cycle.
+    """
+    from datetime import datetime, timezone
+    now_utc = datetime.now(timezone.utc)
+
+    RELEASE_SCHEDULE = [
+        ("CPI April (May 13)",     "KXCPI",        datetime(2026,  5, 13, 12, 30, tzinfo=timezone.utc)),
+        ("June FOMC + Dot Plot",   "KXFEDDECISION", datetime(2026, 6, 17, 18,  0, tzinfo=timezone.utc)),
+        ("NFP May (June 5)",       "KXPAYROLLS",    datetime(2026,  6,  5, 12, 30, tzinfo=timezone.utc)),
+        ("NFP June (July 2)",      "KXPAYROLLS",    datetime(2026,  7,  2, 12, 30, tzinfo=timezone.utc)),
+    ]
+
+    for name, prefix, release_dt in RELEASE_SCHEDULE:
+        hours_until = (release_dt - now_utc).total_seconds() / 3600
+        if not (0 < hours_until <= 24):
+            continue
+        log.info("[PRE-RELEASE] %s in %.1fh -- building brief", name, hours_until)
+        lines = [
+            "**PRE-RELEASE: %s**" % name,
+            "Release in %.1f hours (%s UTC)" % (hours_until, release_dt.strftime("%b %d %H:%M")),
+            "",
+        ]
+        if prefix == "KXPAYROLLS":
+            nfp = get_nfp_estimate()
+            if nfp:
+                lines.append("NFP model: %.0fK expected (adp=%s, sigma=%.0fK)" % (
+                    nfp["estimate"],
+                    "%.0fK" % nfp["adp_value"] if nfp.get("adp_blended") else "N/A",
+                    nfp["std_dev"]/1000))
+        elif prefix in ("KXFEDDECISION", "KXDOTPLOT"):
+            rates = get_fed_rate_data()
+            lines.append("Fed target: %.2f-%.2f%% | SOFR_90d: %.2f%%" % (
+                rates["lower"], rates["upper"], rates.get("sofr_90d") or 0))
+        elif prefix == "KXCPI":
+            cpi = fetch_cleveland_cpi()
+            if cpi:
+                lines.append("Cleveland CPI nowcast: %.2f%%" % (cpi.get("nowcast") or cpi.get("headline_cpi") or 0))
+
+        brief = "\n".join(lines)
+        log.info("[PRE-RELEASE] Brief:\n%s", brief)
+        if not dry_run:
+            try:
+                _post_discord(DISCORD_CH_RESULTS, "📅 " + brief)
+            except Exception as e:
+                log.warning("[PRE-RELEASE] Discord post failed: %s", e)
+
+
 def run_scan(post=None, **kwargs):
-    """Entry point for firm.py — runs one discovery scan."""
+    """Entry point for firm.py -- runs one discovery scan."""
+    # FIX: Rebuild dynamic thesis direction locks from live model each cycle
+    global _dynamic_thesis_locks
+    _dynamic_thesis_locks = build_thesis_locks()
+    log.info("[THESIS] Dynamic locks built: %d active", len(_dynamic_thesis_locks))
+
+    # Check for upcoming releases and post pre-release briefs
+    _dry = (post is False)
+    check_pre_release_briefs(dry_run=_dry)
+
     run_discovery_scan(dry_run=False)
     _save_donnie_state()
     try:

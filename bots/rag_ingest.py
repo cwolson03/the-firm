@@ -245,11 +245,11 @@ def generate_synthetic_data() -> list:
         {'member':'Marie Gluesenkamp Perez','ticker':'AAPL','trade_type':'Purchase','amount':'$1,001 - $15,000','date':d(68)},
         {'member':'Marie Gluesenkamp Perez','ticker':'AMZN','trade_type':'Purchase','amount':'$1,001 - $15,000','date':d(108)},
         # John Hoeven — energy, agriculture (Senate)
-        {'member':'John Hoeven','ticker':'DE','trade_type':'Purchase','amount':' ,001 -  ,000','date':d(15)},
-        {'member':'John Hoeven','ticker':'ADM','trade_type':'Purchase','amount':',001 -  ,000','date':d(55)},
-        {'member':'John Hoeven','ticker':'XOM','trade_type':'Purchase','amount':' ,001 -  ,000','date':d(95)},
-        {'member':'John Hoeven','ticker':'COP','trade_type':'Purchase','amount':',001 -  ,000','date':d(135)},
-        {'member':'John Hoeven','ticker':'BG','trade_type':'Purchase','amount':',001 -  ,000','date':d(175)},
+        {'member':'John Hoeven','ticker':'DE','trade_type':'Purchase','amount':',001 - ,000','date':d(15)},
+        {'member':'John Hoeven','ticker':'ADM','trade_type':'Purchase','amount':',001 - ,000','date':d(55)},
+        {'member':'John Hoeven','ticker':'XOM','trade_type':'Purchase','amount':',001 - ,000','date':d(95)},
+        {'member':'John Hoeven','ticker':'COP','trade_type':'Purchase','amount':',001 - ,000','date':d(135)},
+        {'member':'John Hoeven','ticker':'BG','trade_type':'Purchase','amount':',001 - ,000','date':d(175)},
         # Susan Collins — extra diversified trades
         {'member':'Susan Collins','ticker':'SPY','trade_type':'Purchase','amount':'$50,001 - $100,000','date':d(33)},
         {'member':'Susan Collins','ticker':'BRK.B','trade_type':'Purchase','amount':'$50,001 - $100,000','date':d(73)},

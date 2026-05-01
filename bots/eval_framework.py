@@ -71,7 +71,8 @@ def save_evals(evals: list):
 
 def log_trade_entry(trade_id: str, agent: str, market: str, direction: str,
                     entry_edge_pct: float, llm_confidence: str = '',
-                    raw_thesis: str = '', raw_llm_reason: str = '') -> dict:
+                    raw_thesis: str = '', raw_llm_reason: str = '',
+                    exposure_dollars: float = 0.0) -> dict:
     """Log a trade at entry time. Returns the entry record."""
     record = {
         'trade_id': trade_id,
@@ -81,8 +82,10 @@ def log_trade_entry(trade_id: str, agent: str, market: str, direction: str,
         'entry_date': datetime.now(timezone.utc).isoformat(),
         'entry_edge_pct': entry_edge_pct,
         'llm_confidence_at_entry': llm_confidence,
+        'exposure_dollars': round(exposure_dollars, 2),
         'outcome': 'PENDING',
         'pnl_pct': 0.0,
+        'pnl_dollars': 0.0,
         'resolved_date': '',
         'llm_eval': {},
         'raw_thesis': raw_thesis[:500],
@@ -105,6 +108,10 @@ def resolve_trade(trade_id: str, outcome: str, pnl_pct: float) -> Optional[dict]
     record['outcome'] = outcome.upper()
     record['pnl_pct'] = pnl_pct
     record['resolved_date'] = datetime.now(timezone.utc).isoformat()
+    # Calculate dollar P&L from exposure
+    exposure = record.get('exposure_dollars', 0.0)
+    if exposure > 0:
+        record['pnl_dollars'] = round((pnl_pct / 100) * exposure, 2)
     # Run LLM eval
     record['llm_eval'] = _run_llm_eval(record)
     save_evals(evals)

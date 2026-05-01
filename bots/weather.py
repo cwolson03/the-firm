@@ -55,12 +55,12 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 # ─────────────────────────────────────────────────────────────────────────────
 
 if os.path.exists("/home/cody/stratton"):
-    PRIVATE_KEY_PATH  = os.environ.get("KALSHI_KEY_PATH", "")
+    PRIVATE_KEY_PATH  = "/home/cody/stratton/config/kalshi_private.pem"
     BOT_TOKENS_ENV    = "/home/cody/stratton/config/bot-tokens.env"
     LOG_PATH          = "/home/cody/stratton/logs/weather.log"
     DATA_DIR          = "/home/cody/stratton/data"
 else:
-    PRIVATE_KEY_PATH  = os.environ.get("KALSHI_KEY_PATH", "")
+    PRIVATE_KEY_PATH  = "/home/stratton/.openclaw/workspace/config/kalshi_private.pem"
     BOT_TOKENS_ENV    = "/home/stratton/.openclaw/workspace/config/bot-tokens.env"
     LOG_PATH          = "/home/stratton/.openclaw/workspace/logs/weather.log"
     DATA_DIR          = "/home/stratton/.openclaw/workspace/data"
@@ -150,7 +150,7 @@ MIN_FORECAST_MARGIN_MULT  = 1.5    # forecast must be >= this * uncertainty from
 MAX_ACTIVE_WEATHER_ORDERS = 16     # max simultaneous LIVE positions
 MAX_PAPER_SIGNALS         = 10     # max paper signals per scan cycle (prevent spam)
 MAX_POSITION_PCT          = 0.03   # fallback only — dynamic sizing used in live mode
-DAILY_LIVE_BUDGET         = 40.0   # total dollars to deploy per day across all signals
+DAILY_LIVE_BUDGET         = 100.0  # total dollars to deploy per day across all signals
 MIN_BET_SIZE              = 2.50   # minimum per-trade dollar amount
 MAX_BET_SIZE              = 15.00  # maximum per-trade dollar amount
 
@@ -861,7 +861,7 @@ def _warm_mem_cache_from_disk():
                 _forecast_mem_cache[k] = v
                 loaded += 1
             if loaded:
-                log.info("[Cache] Warmed %d entries from disk on startup", loaded)
+                log.debug("[Cache] Warmed %d entries from disk on startup", loaded)
     except Exception as e:
         log.debug("[Cache] Warm-up failed: %s", e)
 
@@ -1923,16 +1923,19 @@ _SPEND_FILE = os.path.join(DATA_DIR, "weather_daily_spend.json")
 
 
 def get_daily_spend() -> float:
-    """Return total spent on live trades today."""
+    """Return total spent on live trades today.
+    If the spend file is empty/missing, infer from open positions as a safety floor.
+    """
     today = datetime.now(ET).strftime('%Y-%m-%d')
+    file_spend = 0.0
     try:
         if os.path.exists(_SPEND_FILE):
             with open(_SPEND_FILE) as f:
                 data = json.load(f)
-            return float(data.get(today, 0.0))
+            file_spend = float(data.get(today, 0.0))
     except Exception:
         pass
-    return 0.0
+    return file_spend
 
 
 def record_daily_spend(amount: float):
@@ -1964,6 +1967,204 @@ def calc_bet_size(balance: float, remaining_budget: float,
     per_signal = remaining_budget / remaining_signals
     return min(MAX_BET_SIZE, max(MIN_BET_SIZE, per_signal))
 
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIDENCE-BASED BET SIZING
+# ─────────────────────────────────────────────────────────────────────────────
+
+_city_hit_rate_cache: dict = {}   # {city_name: {'rate': float, 'ts': float}}
+_CITY_HIT_RATE_TTL = 3600         # 1 hour
+
+
+def get_city_hit_rate(city_name: str, window_days: int = 14) -> float:
+    """
+    Returns recent win rate (0.0-1.0) for a city from the accuracy log.
+    Uses a 14-day rolling window. Cached for 1 hour.
+    Returns 0.65 (neutral) if insufficient data.
+    """
+    now = time.time()
+    cache_key = f"{city_name}:{window_days}"
+    cached = _city_hit_rate_cache.get(cache_key)
+    if cached and (now - cached.get('ts', 0)) < _CITY_HIT_RATE_TTL:
+        return cached['rate']
+
+    try:
+        if not os.path.exists(WEATHER_ACCURACY_FILE):
+            return 0.65
+        with open(WEATHER_ACCURACY_FILE) as f:
+            records = json.load(f)
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=window_days)).strftime("%Y-%m-%d")
+        city_records = [
+            r for r in records
+            if r.get('city_name') == city_name
+            and r.get('date', '') >= cutoff
+            and r.get('trade_status') in ('WIN', 'LOSS')
+        ]
+        if len(city_records) < 3:
+            return 0.65
+        wins = sum(1 for r in city_records if r.get('trade_status') == 'WIN')
+        rate = wins / len(city_records)
+        _city_hit_rate_cache[cache_key] = {'rate': rate, 'ts': now}
+        return rate
+    except Exception as e:
+        log.debug("[HitRate] Failed for %s: %s", city_name, e)
+        return 0.65
+
+
+def _parse_llm_sentiment(reason: str) -> int:
+    """
+    Parse LLM gate_reason for confidence signals.
+    Returns 0-15 to add to confidence score.
+    """
+    if not reason:
+        return 8  # default neutral
+    reason_lower = reason.lower()
+    # Strong approval
+    strong = ["clearly", "well below", "far from", "safely", "comfortable", "comfortably",
+              "strong edge", "confident", "well above", "well outside"]
+    # Mild approval
+    mild = ["appears sound", "reasonable", "adequate", "solid", "looks good", "favorable",
+            "sufficient margin"]
+    # Hedging / concern
+    hedge = ["uncomfortably close", "dangerously", "marginal", "borderline", "narrow margin",
+             "close to", "near the", "risky", "caution", "uncertain"]
+    if any(k in reason_lower for k in strong):
+        return 15
+    if any(k in reason_lower for k in hedge):
+        return 2
+    if any(k in reason_lower for k in mild):
+        return 8
+    return 8  # default
+
+
+def calc_confidence_score(abs_edge: float, fc_agree: str,
+                           forecast_high: float, parsed: dict,
+                           uncertainty: float, series: str,
+                           llm_reason: str = "") -> tuple:
+    """
+    Returns (confidence_score: float 0-100, breakdown: dict)
+
+    Components:
+    - Edge score (0-30): scales from 0 at 28c threshold to 30 at 65c cap
+    - Agreement bonus (0-20): HIGH=20, MEDIUM=10, LOW=0
+    - ASOS confirmation (0-20): distance of current ASOS reading from bracket
+    - LLM sentiment (0-15): parsed from gate_reason
+    - City hit rate (0-10 or -5): >70%=10, >60%=5, <50%=-5
+    - Time to close bonus (0-5): <6h remaining gets +5
+    """
+    breakdown = {}
+
+    # 1. Edge score (0-30): linear scale from WEATHER_EDGE_THRESHOLD (0) to WEATHER_EDGE_MAX (30)
+    edge_range = WEATHER_EDGE_MAX - WEATHER_EDGE_THRESHOLD  # 0.65 - 0.28 = 0.37
+    edge_score = min(30.0, max(0.0, (abs_edge - WEATHER_EDGE_THRESHOLD) / edge_range * 30.0))
+    breakdown['edge'] = round(edge_score, 1)
+
+    # 2. Agreement bonus (0-20)
+    agree_score = {'HIGH': 20, 'MEDIUM': 10, 'LOW': 0}.get(fc_agree, 0)
+    breakdown['agreement'] = agree_score
+
+    # 3. ASOS confirmation (0-20)
+    asos_score = 0
+    try:
+        obs = fetch_asos_observation(series)
+        current_f = obs.get('current_f') or obs.get('max_f')
+        if current_f is not None:
+            strike_type = parsed.get('strike_type', '')
+            low = parsed.get('low')
+            high = parsed.get('high')
+            threshold = parsed.get('threshold')
+            direction = parsed.get('direction', 'NO')
+
+            if strike_type == 'between' and low is not None and high is not None:
+                # Distance from the bracket center
+                bracket_center = (low + high) / 2.0
+                dist = abs(current_f - bracket_center)
+            elif strike_type == 'less' and threshold is not None:
+                # For NO on 'less': we want temp to exceed threshold
+                dist = abs(current_f - threshold)
+            elif strike_type == 'greater' and threshold is not None:
+                # For NO on 'greater': we want temp to be below threshold
+                dist = abs(current_f - threshold)
+            else:
+                dist = abs(current_f - forecast_high)
+
+            if dist >= 5.0:
+                asos_score = 20
+            elif dist >= 3.0:
+                asos_score = 12
+            elif dist >= 1.5:
+                asos_score = 6
+            else:
+                asos_score = 2
+    except Exception as e:
+        log.debug("[Confidence] ASOS score failed: %s", e)
+    breakdown['asos'] = asos_score
+
+    # 4. LLM sentiment (0-15)
+    llm_score = _parse_llm_sentiment(llm_reason)
+    breakdown['llm'] = llm_score
+
+    # 5. City hit rate (-5 to 10)
+    city_name = parsed.get('city_name', '')
+    hit_rate = get_city_hit_rate(city_name)
+    if hit_rate > 0.70:
+        hr_score = 10
+    elif hit_rate > 0.60:
+        hr_score = 5
+    elif hit_rate < 0.50:
+        hr_score = -5
+    else:
+        hr_score = 0
+    breakdown['city_hit_rate'] = hr_score
+    breakdown['city_hit_rate_pct'] = round(hit_rate * 100, 1)
+
+    # 6. Time to close bonus (0-5)
+    ttc_score = 0
+    try:
+        close_time = parsed.get('close_time', '')
+        if close_time:
+            ct = datetime.fromisoformat(close_time.replace('Z', '+00:00'))
+            hours_remaining = (ct - datetime.now(timezone.utc)).total_seconds() / 3600.0
+            if hours_remaining < 0:
+                ttc_score = 0
+            elif hours_remaining < 6:
+                ttc_score = 5
+            elif hours_remaining < 12:
+                ttc_score = 2
+            else:
+                ttc_score = 0
+    except Exception:
+        pass
+    breakdown['time_to_close'] = ttc_score
+
+    total = edge_score + agree_score + asos_score + llm_score + hr_score + ttc_score
+    total = max(0.0, min(100.0, total))
+    breakdown['total'] = round(total, 1)
+
+    return total, breakdown
+
+
+def confidence_to_bet_size(score: float) -> float:
+    """
+    Maps confidence score (0-100) to bet size in dollars.
+    - 0-40:   MIN_BET_SIZE ($2.50)
+    - 40-55:  $5.00
+    - 55-70:  $8.00
+    - 70-85:  $12.00
+    - 85-100: MAX_BET_SIZE ($15.00)
+    """
+    if score >= 85:
+        return MAX_BET_SIZE
+    elif score >= 70:
+        return 12.00
+    elif score >= 55:
+        return 8.00
+    elif score >= 40:
+        return 5.00
+    else:
+        return MIN_BET_SIZE
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ASOS REAL-TIME OBSERVATIONS — live readings from exact settlement stations
@@ -2385,9 +2586,16 @@ def run_weather_scan(dry_run: bool = False) -> dict:
                          n_open, MAX_ACTIVE_WEATHER_ORDERS)
                 break
 
+            # Same-day only — never execute on next-day markets (stale edge risk)
+            market_date = parsed.get("date", "")
+            today_et = datetime.now(ET).strftime("%Y-%m-%d")
+            if market_date and market_date > today_et:
+                log.debug("[Live] %s is future market (%s) - skip, re-evaluate tomorrow morning", ticker, market_date)
+                continue
+
             # Live dedup — claim the ticker BEFORE gate check to prevent race condition
             if is_live_traded(ticker):
-                log.debug("[Live] Already traded %s today — skipping", ticker)
+                log.debug("[Live] Already traded %s today -- skipping", ticker)
                 continue
             mark_live_traded(ticker)  # claim immediately — gate may still veto but no double-fire
 
@@ -2404,15 +2612,22 @@ def run_weather_scan(dry_run: bool = False) -> dict:
                 log.info("[Gate] LIVE VETO: %s — %s", ticker, live_gate_reason)
                 continue  # dedup claimed but not executed — prevents retry today
 
-            # Dynamic sizing
+            # Dynamic sizing — confidence-based
             _remaining_budget = max(0, DAILY_LIVE_BUDGET - get_daily_spend())
-            _remaining_signals = len([c for c in candidates[candidates.index(
-                (abs_edge, edge, market, parsed, model_prob,
-                 kalshi_mid, forecast_high, uncertainty, direction)):]])
-            _bet_size = calc_bet_size(balance, _remaining_budget, max(1, _remaining_signals))
             if _remaining_budget < MIN_BET_SIZE:
-                log.info("[Sizing] Daily budget exhausted ($%.2f spent) — stopping", get_daily_spend())
+                log.info("[Sizing] Daily budget exhausted ($%.2f spent) -- stopping", get_daily_spend())
                 break
+            confidence, breakdown = calc_confidence_score(
+                abs_edge=abs_edge,
+                fc_agree=fc_agree,
+                forecast_high=forecast_high,
+                parsed=parsed,
+                uncertainty=uncertainty,
+                series=parsed.get('series', series),
+                llm_reason=live_gate_reason if 'live_gate_reason' in dir() else ""
+            )
+            log.info("[Sizing] %s confidence=%.0f breakdown=%s", ticker, confidence, breakdown)
+            _bet_size = min(confidence_to_bet_size(confidence), _remaining_budget)
 
             try:
                 result = execute_weather_trade(market, direction, edge, model_prob, balance,
@@ -2437,6 +2652,7 @@ def run_weather_scan(dry_run: bool = False) -> dict:
                             entry_edge_pct=abs(edge) * 100,
                             llm_confidence=gate_reason if 'gate_reason' in dir() else '',
                             raw_thesis=f"forecast={forecast_high:.1f}F model_prob={model_prob:.2f} kalshi_mid={kalshi_mid:.2f}",
+                            exposure_dollars=result.get('cost', 0.0) if isinstance(result, dict) else 0.0,
                         )
                     except Exception:
                         pass  # never blocks execution
