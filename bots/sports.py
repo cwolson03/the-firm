@@ -65,6 +65,7 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 # PAPER MODE CONSTANT — NEVER CHANGE WITHOUT CODY APPROVAL
 # ============================================================
 SPORTS_PAPER_MODE = True  # paper mode — flip to False when ready for live sports  # Set to False only when Cody explicitly authorizes live trading
+SPORTS_DISCORD_MUTED = True  # mute all Discord signals until sports goes live
 
 KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 KEY_ID      = "2e462103-bdd5-4a1b-b231-17191bded0bb"
@@ -83,12 +84,12 @@ BRAD_DISCORD_CH  = 1491861968355590242   # #sports-signals
 BRAD_DISCORD_CH2 = 1491861971635540108   # #promo-tracker
 
 # ── Ticker blocklist (secondary guard for non-sports markets) ─────────────────
-BLOCKED_TICKER_PREFIXES = ['KXAAAGASW', 'KXTRUMPSAY', 'KXTRUMPMENTION', 'KXTRUMPUFC']
+BLOCKED_TICKER_PREFIXES = ['KXAAAGASW', 'KXTRUMPSAY', 'KXTRUMPMENTION', 'KXTRUMPUFC', 'KXUFCFIGHT', 'KXUFCWOMEN']  # UFC blocked — 0W/3L, market is efficiently priced by sharp MMA bettors
 
 # ── Strategy definitions ──────────────────────────────────────────────────────
 # S1: Live Game Winners
 STINK_BID_DISCOUNT_S1 = 0.20    # 20% below current mid (reduced from 30% — more fills, still strong edge)
-MIN_FAVORITE_PRICE_S1 = 0.55    # only bid where favorite > 55¢
+MIN_FAVORITE_PRICE_S1 = 0.72    # only bid where favorite > 72¢ (skip 55-72c death zone — 0W/6L in data)
 MAX_ACTIVE_BIDS_S1    = 5       # max 5 open stink bids for S1
 
 # S2: Spread/Prop Markets
@@ -98,7 +99,7 @@ MAX_ACTIVE_BIDS_S2    = 3       # max 3 open stink bids for S2
 
 # S3: Tournament/Outright Markets
 STINK_BID_DISCOUNT_S3 = 0.35    # 35% below current mid (more aggressive, longer time horizon)
-MIN_FAVORITE_PRICE_S3 = 0.70    # only bid where favorite > 70¢ (clear frontrunners only)
+MIN_FAVORITE_PRICE_S3 = 0.85    # only bid where favorite > 85¢ (UFC 0W/3L — require dominant favorites only)
 MAX_ACTIVE_BIDS_S3    = 2       # max 2 open stink bids for S3
 MAX_DAYS_UNTIL_CLOSE_S3 = 30    # tournament markets can close up to 30 days out
 
@@ -120,13 +121,10 @@ STINK_BID_DISCOUNT     = STINK_BID_DISCOUNT_S1
 
 def get_s1_discount(favorite_price: float) -> float:
     """
-    Two-tier S1 discount:
-    - Strong favorites (>70¢): 20% off — they rarely dump hard
-    - Weaker favorites (55-70¢): 25% off — more volatile, slightly deeper
+    Flat 20% discount for all S1 bids.
+    Min price is now 72c so all bids are strong favorites — no tiering needed.
     """
-    if favorite_price >= 0.70:
-        return 0.20
-    return 0.25
+    return 0.20
 MIN_FAVORITE_PRICE     = MIN_FAVORITE_PRICE_S1
 MAX_ACTIVE_BIDS        = MAX_ACTIVE_BIDS_S1 + MAX_ACTIVE_BIDS_S2 + MAX_ACTIVE_BIDS_S3  # total
 
@@ -350,6 +348,8 @@ BRAD_TOKEN = _load_brad_token()
 
 
 def post_discord(message: str, channel_id: int = BRAD_DISCORD_CH, dry_run: bool = False) -> bool:
+    if SPORTS_DISCORD_MUTED:
+        return True  # silenced
     if dry_run:
         print("\n" + "─" * 60)
         print(f"[DRY RUN — Discord → channel {channel_id}]")
@@ -943,6 +943,9 @@ def get_game_phase(ticker: str, title: str, espn_data: dict, favorite_side: str 
                 blowout_threshold = 4 if is_mlb else 10
                 if is_late and not favorite_winning and score_diff >= blowout_threshold:
                     return 'blowout'  # favorite is losing badly in late game
+                # Early-game deficit check: if favorite is already losing by 2+ in early game, skip
+                if not is_late and not favorite_winning and score_diff >= 2:
+                    return 'early_deficit'  # underdog winning in early game — not panic, real reprice
                 if is_cricket:
                     # Cricket: period > 1 or linescores with 2+ entries = second inning (chase)
                     linescores = []
@@ -1090,9 +1093,9 @@ def find_favorites(markets: list, live_keywords: set = None, today_keywords: set
         # ── Step 5: Timing check ─────────────────────────────────────────────
         phase = get_game_phase(ticker, title, espn_data)
 
-        if phase == 'blowout':
-            # Favorite is losing badly in late game — skip and cancel any open bids
-            log.info(f"[Timing] BLOWOUT: {ticker} — favorite losing in late game, skipping")
+        if phase in ('blowout', 'early_deficit'):
+            # Either late-game blowout or early deficit — underdog winning, not panic
+            log.info(f"[Timing] SKIP {phase.upper()}: {ticker} — underdog winning, not panic dump")
             continue
         elif is_cricket:
             # Cricket: ONLY place bids in first inning. Cancel at second.

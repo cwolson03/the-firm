@@ -43,6 +43,7 @@ import statistics
 from datetime import datetime, timezone, timedelta
 ET = timezone(timedelta(hours=-4))  # EDT (UTC-4); update to -5 for EST in Nov
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
@@ -55,12 +56,12 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 # ─────────────────────────────────────────────────────────────────────────────
 
 if os.path.exists("/home/cody/stratton"):
-    PRIVATE_KEY_PATH  = "/home/cody/stratton/config/kalshi_private.pem"
+    PRIVATE_KEY_PATH  = os.environ.get("KALSHI_KEY_PATH", "")
     BOT_TOKENS_ENV    = "/home/cody/stratton/config/bot-tokens.env"
     LOG_PATH          = "/home/cody/stratton/logs/weather.log"
     DATA_DIR          = "/home/cody/stratton/data"
 else:
-    PRIVATE_KEY_PATH  = "/home/stratton/.openclaw/workspace/config/kalshi_private.pem"
+    PRIVATE_KEY_PATH  = os.environ.get("KALSHI_KEY_PATH", "")
     BOT_TOKENS_ENV    = "/home/stratton/.openclaw/workspace/config/bot-tokens.env"
     LOG_PATH          = "/home/stratton/.openclaw/workspace/logs/weather.log"
     DATA_DIR          = "/home/stratton/.openclaw/workspace/data"
@@ -148,6 +149,7 @@ WEATHER_EDGE_THRESHOLD    = 0.28   # 28¢ minimum edge (backtest optimized: >25�
 WEATHER_EDGE_MAX          = 0.65   # cap - above this kalshi is near certain, model is wrong
 MIN_FORECAST_MARGIN_MULT  = 1.5    # forecast must be >= this * uncertainty from threshold to signal
 MAX_ACTIVE_WEATHER_ORDERS = 16     # max simultaneous LIVE positions
+MAX_POSITIONS_PER_CITY    = 2      # max open positions per city (correlation risk)
 MAX_PAPER_SIGNALS         = 10     # max paper signals per scan cycle (prevent spam)
 MAX_POSITION_PCT          = 0.03   # fallback only — dynamic sizing used in live mode
 DAILY_LIVE_BUDGET         = 100.0  # total dollars to deploy per day across all signals
@@ -955,6 +957,29 @@ def prefetch_all_forecasts():
             log.debug("[Prefetch] Open-Meteo %s: %s", series, e)
         time.sleep(0.05)
 
+        # Ensemble (GFS 31-member, replaces standard Open-Meteo for uncertainty)
+        success_e = 0
+        try:
+            ens_data = _fetch_open_meteo_ensemble(series, city)
+            if ens_data:
+                key = "ensemble_%s" % series
+                disk_cache[key] = {'data': ens_data, 'ts': now_ts}
+                _forecast_mem_cache[key] = {'data': ens_data, 'ts': now_ts}
+                success_e += 1
+        except Exception as e:
+            log.debug("[Prefetch] Ensemble %s: %s", series, e)
+        time.sleep(0.05)
+
+        # AIGEFS (AI-augmented GFS ensemble — optional third source)
+        try:
+            aigefs_data = _fetch_aigefs_daily(series, city)
+            if aigefs_data:
+                key = "aigefs_%s" % series
+                disk_cache[key] = {'data': aigefs_data, 'ts': now_ts}
+                _forecast_mem_cache[key] = {'data': aigefs_data, 'ts': now_ts}
+        except Exception as e:
+            log.debug("[Prefetch] AIGEFS %s: %s", series, e)
+
     # Write updated disk cache
     try:
         with open(FORECAST_CACHE_FILE, 'w') as f:
@@ -962,12 +987,17 @@ def prefetch_all_forecasts():
     except Exception as e:
         log.warning("[Prefetch] Cache write failed: %s", e)
 
+    # Count ensemble and AIGEFS successes from cache
+    success_e_total = sum(1 for k in disk_cache if k.startswith("ensemble_"))
+    success_a_total = sum(1 for k in disk_cache if k.startswith("aigefs_"))
     elapsed = time.time() - start
-    log.info("[Prefetch] Done in %.1fs | Tomorrow.io: %d/%d | Open-Meteo: %d/%d | errors: %s",
+    log.info("[Prefetch] Done in %.1fs | Tomorrow.io: %d/%d | Open-Meteo: %d/%d | Ensemble: %d/%d | AIGEFS: %d/%d | errors: %s",
              elapsed, success_t, len(WEATHER_SERIES), success_o, len(WEATHER_SERIES),
+             success_e_total, len(WEATHER_SERIES),
+             success_a_total, len(WEATHER_SERIES),
              errors if errors else "none")
 
-    if success_t + success_o > 0:
+    if success_t + success_o + success_e_total > 0:
         _mark_prefetch_done()
 
     return success_t, success_o
@@ -1120,6 +1150,65 @@ def _fetch_open_meteo_daily(series: str, coords: dict) -> dict:
 
 
 
+
+def _fetch_open_meteo_ensemble(series: str, coords: dict) -> dict:
+    """
+    Fetch 31-member GFS ensemble from Open-Meteo.
+    Returns {date: {'mean': float, 'std': float, 'min': float, 'max': float, 'members': int}}
+    Free API: ensemble-api.open-meteo.com
+    """
+    import statistics as _stats
+    try:
+        r = requests.get(
+            "https://ensemble-api.open-meteo.com/v1/ensemble",
+            params={
+                "latitude":         coords["lat"],
+                "longitude":        coords["lon"],
+                "daily":            "temperature_2m_max",
+                "temperature_unit": "fahrenheit",
+                "forecast_days":    6,
+                "models":           "gfs_seamless",
+                "timezone":         "UTC",
+            },
+            timeout=20,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            daily = data.get("daily", {})
+            dates = daily.get("time", [])
+            # Collect all member keys: temperature_2m_max, temperature_2m_max_member01, etc.
+            member_keys = [k for k in daily.keys() if k.startswith("temperature_2m_max")]
+            if not member_keys or not dates:
+                log.debug("[Ensemble] %s: no member data found", series)
+                return {}
+            result = {}
+            for i, date_str in enumerate(dates):
+                vals = []
+                for mk in member_keys:
+                    member_vals = daily[mk]
+                    if i < len(member_vals) and member_vals[i] is not None:
+                        vals.append(float(member_vals[i]))
+                if vals:
+                    mean_f = sum(vals) / len(vals)
+                    std_f = _stats.stdev(vals) if len(vals) >= 2 else 0.0
+                    result[date_str] = {
+                        'mean': round(mean_f, 2),
+                        'std':  round(std_f, 2),
+                        'min':  round(min(vals), 2),
+                        'max':  round(max(vals), 2),
+                        'members': len(vals),
+                        'member_temps': [round(v, 2) for v in vals],
+                    }
+            log.info("[Ensemble] %s: %d dates, %d members each", series, len(result), len(member_keys))
+            time.sleep(0.1)
+            return result
+        else:
+            log.debug("[Ensemble] %s: HTTP %s", series, r.status_code)
+    except Exception as e:
+        log.debug("[Ensemble] %s failed: %s", series, e)
+    return {}
+
+
 def _fetch_noaa_daily(series: str, coords: dict) -> dict:
     """
     Fetch NOAA gridpoint forecast — highly accurate US weather.
@@ -1176,6 +1265,214 @@ def _save_forecast_to_disk(cache_key: str, data: dict, ts: float):
             json.dump(disk, f)
     except Exception as e:
         log.debug("[Forecast] Disk cache save failed: %s", e)
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AIGEFS — NOAA AI-augmented GFS Ensemble (31 members from AWS S3)
+# ─────────────────────────────────────────────────────────────────────────────
+
+import warnings as _aigefs_warnings
+_aigefs_warnings.filterwarnings("ignore", message="ecCodes.*recommended")
+
+AIGEFS_BUCKET_URL = "https://noaa-nws-graphcastgfs-pds.s3.amazonaws.com"
+AIGEFS_NUM_MEMBERS = 31   # mem000 through mem030
+AIGEFS_TIMEOUT = 15       # seconds per HTTP request
+AIGEFS_MAX_WORKERS = 8    # parallel downloads per city
+AIGEFS_MAX_DATES = 3      # only fetch today + 2 days (active trading window)
+
+# Cache idx byte offsets — same across all members for a given forecast hour
+_aigefs_idx_cache = {}     # {(cycle_ymd, cycle_hr, fhour): (byte_start, byte_end)}
+
+
+def _aigefs_sfc_url(date_str_ymd, cycle, member, fhour):
+    """Build S3 URL for AIGEFS surface GRIB2 file."""
+    return "%s/EAGLE_ensemble/aigefs.%s/%s/mem%03d/model/atmos/grib2/aigefs.t%sz.sfc.f%03d.grib2" % (
+        AIGEFS_BUCKET_URL, date_str_ymd, cycle, member, cycle, fhour)
+
+
+def _aigefs_parse_idx_for_tmp2m(idx_text):
+    """Parse .idx file, return (byte_start, byte_end) for TMP:2 m above ground."""
+    lines = idx_text.strip().split("\n")
+    records = []
+    for line in lines:
+        parts = line.split(":")
+        if len(parts) >= 5:
+            records.append({"offset": int(parts[1]), "var": parts[3], "level": parts[4]})
+    for i, rec in enumerate(records):
+        if rec["var"] == "TMP" and "2 m" in rec["level"]:
+            start = rec["offset"]
+            end = records[i+1]["offset"] - 1 if i+1 < len(records) else None
+            return start, end
+    return None, None
+
+
+def _aigefs_extract_temp(grib_bytes, target_lat, target_lon):
+    """Parse GRIB2 bytes via eccodes, return temperature in Kelvin at nearest grid point."""
+    import tempfile
+    try:
+        import eccodes
+    except Exception:
+        return None
+    tmpf = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".grib2", delete=False) as f:
+            f.write(grib_bytes)
+            tmpf = f.name
+        with open(tmpf, "rb") as f:
+            msgid = eccodes.codes_grib_new_from_file(f)
+            if msgid is None:
+                return None
+            try:
+                nearest = eccodes.codes_grib_find_nearest(msgid, target_lat, target_lon)
+                best = min(nearest, key=lambda n: n.distance)
+                return best.value
+            finally:
+                eccodes.codes_release(msgid)
+    except Exception:
+        return None
+    finally:
+        if tmpf:
+            try:
+                os.unlink(tmpf)
+            except Exception:
+                pass
+
+
+def _aigefs_fetch_one(date_ymd, cycle, member, fhour, target_lat, target_lon):
+    """Fetch TMP:2m for one member at one forecast hour. Returns temp in Kelvin or None."""
+    _req = requests
+    try:
+        # Each member has different byte offsets — cache per (date, cycle, member, fhour)
+        cache_key = (date_ymd, cycle, member, fhour)
+        if cache_key in _aigefs_idx_cache:
+            start, end = _aigefs_idx_cache[cache_key]
+        else:
+            idx_url = _aigefs_sfc_url(date_ymd, cycle, member, fhour) + ".idx"
+            r_idx = _req.get(idx_url, timeout=AIGEFS_TIMEOUT)
+            if r_idx.status_code != 200:
+                return None
+            start, end = _aigefs_parse_idx_for_tmp2m(r_idx.text)
+            if start is None:
+                return None
+            _aigefs_idx_cache[cache_key] = (start, end)
+
+        grib_url = _aigefs_sfc_url(date_ymd, cycle, member, fhour)
+        if end is not None:
+            headers = {"Range": "bytes=%d-%d" % (start, end)}
+        else:
+            headers = {"Range": "bytes=%d-" % start}
+        r_data = _req.get(grib_url, headers=headers, timeout=AIGEFS_TIMEOUT)
+        if r_data.status_code not in (200, 206):
+            return None
+        return _aigefs_extract_temp(r_data.content, target_lat, target_lon)
+    except Exception:
+        return None
+
+
+def _aigefs_find_cycle():
+    """Find best available AIGEFS cycle. Returns (date_ymd, cycle_hr) or (None, None)."""
+    now = datetime.now(timezone.utc)
+    candidates = [
+        (now.strftime("%Y%m%d"), "00"),
+        ((now - timedelta(days=1)).strftime("%Y%m%d"), "18"),
+        ((now - timedelta(days=1)).strftime("%Y%m%d"), "12"),
+        ((now - timedelta(days=1)).strftime("%Y%m%d"), "06"),
+    ]
+    for date_ymd, cycle in candidates:
+        idx_url = _aigefs_sfc_url(date_ymd, cycle, 0, 6) + ".idx"
+        try:
+            r = requests.head(idx_url, timeout=5)
+            if r.status_code == 200:
+                return date_ymd, cycle
+        except Exception:
+            continue
+    return None, None
+
+
+def _aigefs_fhours_for_date(cycle_ymd, cycle_hr, target_date):
+    """Return forecast hours covering US daytime (12Z-00Z) for target_date."""
+    cycle_dt = datetime.strptime(cycle_ymd + cycle_hr, "%Y%m%d%H").replace(tzinfo=timezone.utc)
+    target_dt = datetime.strptime(target_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    start_utc = target_dt.replace(hour=12)
+    end_utc = target_dt.replace(hour=23, minute=59)
+    fhours = []
+    for fh in range(0, 385, 6):
+        valid_time = cycle_dt + timedelta(hours=fh)
+        if start_utc <= valid_time <= end_utc:
+            fhours.append(fh)
+    if not fhours:
+        # Broader window
+        start_utc = target_dt.replace(hour=6)
+        for fh in range(0, 385, 6):
+            valid_time = cycle_dt + timedelta(hours=fh)
+            if start_utc <= valid_time <= end_utc:
+                fhours.append(fh)
+    return fhours
+
+
+def _fetch_aigefs_daily(series, coords):
+    """
+    Fetch AIGEFS 31-member ensemble daily high temperature.
+    Returns {date_str: {'mean': float, 'std': float, 'members': int, 'member_temps': [...]}}
+    Temperatures in Fahrenheit. member_temps used for combining with GFS ensemble.
+    """
+    cycle_ymd, cycle_hr = _aigefs_find_cycle()
+    if cycle_ymd is None:
+        log.debug("[AIGEFS] No available cycle found")
+        return {}
+
+    log.debug("[AIGEFS] Using cycle %s/%sZ for %s", cycle_ymd, cycle_hr, series)
+
+    target_lat = coords["lat"]
+    target_lon = coords["lon"]
+
+    now = datetime.now(timezone.utc)
+    target_dates = [(now + timedelta(days=d)).strftime("%Y-%m-%d") for d in range(AIGEFS_MAX_DATES)]
+
+    result = {}
+
+    for target_date in target_dates:
+        fhours = _aigefs_fhours_for_date(cycle_ymd, cycle_hr, target_date)
+        if not fhours:
+            continue
+
+        member_highs = []
+
+        # Note: idx offsets differ per member, fetched on-demand in _aigefs_fetch_one
+
+        def _fetch_member(mem):
+            temps = []
+            for fh in fhours:
+                val_k = _aigefs_fetch_one(cycle_ymd, cycle_hr, mem, fh, target_lat, target_lon)
+                if val_k is not None and val_k > 200:
+                    temps.append(val_k)
+            return max(temps) if temps else None
+
+        with ThreadPoolExecutor(max_workers=AIGEFS_MAX_WORKERS) as executor:
+            futures = {executor.submit(_fetch_member, m): m for m in range(AIGEFS_NUM_MEMBERS)}
+            for future in as_completed(futures):
+                try:
+                    val_k = future.result()
+                    if val_k is not None:
+                        val_f = val_k * 9.0 / 5.0 - 459.67
+                        member_highs.append(round(val_f, 2))
+                except Exception:
+                    pass
+
+        if len(member_highs) >= 5:
+            mean_f = sum(member_highs) / len(member_highs)
+            std_f = statistics.stdev(member_highs) if len(member_highs) >= 2 else 0.0
+            result[target_date] = {
+                'mean': round(mean_f, 2),
+                'std': round(std_f, 2),
+                'members': len(member_highs),
+                'member_temps': member_highs,
+            }
+            log.debug("[AIGEFS] %s %s: mean=%.1fF std=%.1fF members=%d",
+                      series, target_date, mean_f, std_f, len(member_highs))
+
+    return result
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PROBABILITY CALCULATION — range brackets
@@ -1262,38 +1559,72 @@ def get_consensus_forecast(series: str, date: str) -> tuple:
     if not city:
         return None, 5.0, 'LOW'
 
-    temps = []
-
     # Tomorrow.io — read from memory cache only (never call API here)
     t_key = "daily_%s" % series
     t_cached = _forecast_mem_cache.get(t_key)
+    t_val = None
     if t_cached and date in t_cached.get("data", {}):
-        temps.append(t_cached["data"][date])
+        t_val = t_cached["data"][date]
 
-    # Open-Meteo — read from memory cache only
-    om_key = "openmeteo_%s" % series
-    om_cached = _forecast_mem_cache.get(om_key)
-    if om_cached and date in om_cached.get("data", {}):
-        temps.append(om_cached["data"][date])
+    # Ensemble — check memory cache first (keyed as ensemble_{series})
+    ens_key = "ensemble_%s" % series
+    ens_cached = _forecast_mem_cache.get(ens_key)
+    ens_stats = None
+    if ens_cached and date in ens_cached.get("data", {}):
+        ens_stats = ens_cached["data"][date]
 
-    if not temps:
+    # AIGEFS — check memory cache (keyed as aigefs_{series})
+    aigefs_key = "aigefs_%s" % series
+    aigefs_cached = _forecast_mem_cache.get(aigefs_key)
+    aigefs_stats = None
+    if aigefs_cached and date in aigefs_cached.get("data", {}):
+        aigefs_stats = aigefs_cached["data"][date]
+
+    if t_val is None and ens_stats is None:
         return None, 5.0, 'LOW'
 
-    forecast_high = sum(temps) / len(temps)
+    # Build combined ensemble pool: GFS members + AIGEFS members
+    combined_members = []
+    if ens_stats is not None and 'member_temps' in ens_stats:
+        combined_members.extend(ens_stats['member_temps'])
+    if aigefs_stats is not None and 'member_temps' in aigefs_stats:
+        combined_members.extend(aigefs_stats['member_temps'])
 
-    if len(temps) >= 2:
-        import statistics as _stats
-        std = _stats.stdev(temps) if len(temps) >= 2 else 0
-        if std < 2.0:
-            agreement = 'HIGH'
-        elif std < 4.0:
-            agreement = 'MEDIUM'
-        else:
-            agreement = 'LOW'
-        # Use actual std_dev as uncertainty (min 1.5F, max 6F)
-        uncertainty = max(1.5, min(6.0, std * 1.5))
+    # If we have combined member-level data, use it for uncertainty
+    if combined_members and len(combined_members) >= 5:
+        combined_mean = sum(combined_members) / len(combined_members)
+        combined_std = statistics.stdev(combined_members) if len(combined_members) >= 2 else 0.0
+        n_members = len(combined_members)
+    elif ens_stats is not None:
+        combined_mean = ens_stats['mean']
+        combined_std = ens_stats['std']
+        n_members = ens_stats.get('members', 31)
+    elif aigefs_stats is not None:
+        combined_mean = aigefs_stats['mean']
+        combined_std = aigefs_stats['std']
+        n_members = aigefs_stats.get('members', 31)
     else:
-        # Single model — no cross-check, mark LOW to skip signal
+        combined_mean = None
+        combined_std = None
+        n_members = 0
+
+    if t_val is not None and combined_mean is not None:
+        # Both T.io and ensemble(s): average T.io and combined ensemble mean
+        forecast_high = (t_val + combined_mean) / 2.0
+        uncertainty   = max(1.5, min(6.0, combined_std * 1.5))
+        agreement = 'HIGH' if combined_std < 2.0 else ('MEDIUM' if combined_std < 4.0 else 'LOW')
+        log.debug("[Consensus] %s %s: T.io=%.1f ens_mean=%.1f ens_std=%.1f members=%d → fc=%.1f unc=%.1f agree=%s",
+                  series, date, t_val, combined_mean, combined_std, n_members, forecast_high, uncertainty, agreement)
+    elif combined_mean is not None:
+        # Only ensemble(s) (T.io rate limited)
+        forecast_high = combined_mean
+        uncertainty   = max(1.5, min(6.0, combined_std * 1.5))
+        agreement = 'HIGH' if combined_std < 2.0 else ('MEDIUM' if combined_std < 4.0 else 'LOW')
+        log.debug("[Consensus] %s %s: ensemble-only mean=%.1f std=%.1f members=%d agree=%s",
+                  series, date, combined_mean, combined_std, n_members, agreement)
+    else:
+        # Only T.io (ensemble failed) — fallback with MEDIUM
+        forecast_high = t_val
         today = datetime.now(timezone.utc).date()
         try:
             target = datetime.strptime(date, '%Y-%m-%d').date()
@@ -1301,7 +1632,8 @@ def get_consensus_forecast(series: str, date: str) -> tuple:
         except Exception:
             days_out = 1
         uncertainty = 2.5 if days_out <= 0 else (3.5 if days_out == 1 else 5.0)
-        agreement = 'LOW'  # single model = no cross-check, skip signal
+        agreement = 'MEDIUM'  # single model fallback
+        log.debug("[Consensus] %s %s: T.io-only fc=%.1f agree=MEDIUM", series, date, forecast_high)
 
     return forecast_high, uncertainty, agreement
 
@@ -2246,6 +2578,31 @@ def get_asos_adjusted_forecast(series: str, date: str,
     return forecast_high, 'model_only'
 
 
+def get_orderbook_signal(market: dict) -> tuple:
+    """
+    Analyze bid/ask spread and volume for market quality signal.
+    Returns (imbalance_score: float 0-1, spread_pct: float, volume: int)
+    
+    imbalance_score > 0.5 means YES side is heavily bid (retail piling in → good NO signal)
+    Tight spread = liquid market, edge is real
+    Wide spread = illiquid, price may be stale
+    """
+    yes_bid = float(market.get('yes_bid_dollars', 0) or 0)
+    yes_ask = float(market.get('yes_ask_dollars', 1) or 1)
+    volume  = int(market.get('volume', 0) or 0)
+    
+    # Spread as % of mid
+    mid = (yes_bid + yes_ask) / 2 if yes_ask > 0 else 0.5
+    spread = yes_ask - yes_bid if yes_ask > yes_bid else 0
+    spread_pct = spread / mid if mid > 0 else 1.0
+    
+    # Imbalance: high yes_bid relative to mid = market leaning YES
+    # For NO bets: if market is leaning YES (imbalance > 0.5), that's the retail side we fade
+    imbalance = yes_bid / mid if mid > 0 else 0.5
+    
+    return imbalance, spread_pct, volume
+
+
 _scan_lock = __import__('threading').Lock()
 
 def run_weather_scan(dry_run: bool = False) -> dict:
@@ -2593,6 +2950,14 @@ def run_weather_scan(dry_run: bool = False) -> dict:
                 log.debug("[Live] %s is future market (%s) - skip, re-evaluate tomorrow morning", ticker, market_date)
                 continue
 
+            # Per-city cap — max 2 open positions per city (correlation risk)
+            city_series = parsed.get("series", "")
+            city_open_count = sum(1 for t in weather_positions if t.startswith(city_series + "-"))
+            if city_open_count >= MAX_POSITIONS_PER_CITY:
+                log.debug("[Live] %s: already %d/%d positions for %s city — skipping",
+                          ticker, city_open_count, MAX_POSITIONS_PER_CITY, city_name)
+                continue
+
             # Live dedup — claim the ticker BEFORE gate check to prevent race condition
             if is_live_traded(ticker):
                 log.debug("[Live] Already traded %s today -- skipping", ticker)
@@ -2617,6 +2982,11 @@ def run_weather_scan(dry_run: bool = False) -> dict:
             if _remaining_budget < MIN_BET_SIZE:
                 log.info("[Sizing] Daily budget exhausted ($%.2f spent) -- stopping", get_daily_spend())
                 break
+            # Order book signal
+            ob_imbalance, ob_spread, ob_volume = get_orderbook_signal(market)
+            ob_bonus = 5 if ob_imbalance > 0.6 else (2 if ob_imbalance > 0.5 else 0)
+            ob_spread_penalty = -3 if ob_spread > 0.15 else 0
+
             confidence, breakdown = calc_confidence_score(
                 abs_edge=abs_edge,
                 fc_agree=fc_agree,
@@ -2626,7 +2996,9 @@ def run_weather_scan(dry_run: bool = False) -> dict:
                 series=parsed.get('series', series),
                 llm_reason=live_gate_reason if 'live_gate_reason' in dir() else ""
             )
-            log.info("[Sizing] %s confidence=%.0f breakdown=%s", ticker, confidence, breakdown)
+            confidence = min(100, max(0, confidence + ob_bonus + ob_spread_penalty))
+            log.info("[Sizing] %s confidence=%.0f ob_imbalance=%.2f ob_spread=%.0f%% breakdown=%s",
+                     ticker, confidence, ob_imbalance, ob_spread*100, breakdown)
             _bet_size = min(confidence_to_bet_size(confidence), _remaining_budget)
 
             try:
@@ -2736,6 +3108,171 @@ def run_scan(post=None, **kwargs):
     except Exception:
         pass
     return result
+
+
+def run_calibration_check():
+    """
+    Read weather_accuracy.json and produce calibration analysis:
+    - Per model_prob bucket (0-10%, 10-20%, ...) actual YES rate vs expected
+    - Win rate by direction (YES/NO)
+    - Win rate by edge bucket
+    - Best performing cities
+    Saves report to calibration_report.json and prints a clean table.
+    """
+    import math as _math
+    from collections import defaultdict
+
+    if not os.path.exists(WEATHER_ACCURACY_FILE):
+        print("No accuracy data found at %s" % WEATHER_ACCURACY_FILE)
+        return {}
+
+    try:
+        with open(WEATHER_ACCURACY_FILE) as f:
+            entries = json.load(f)
+    except Exception as e:
+        print("Failed to load accuracy data: %s" % e)
+        return {}
+
+    # Filter to resolved entries only
+    resolved = [e for e in entries if e.get('market_result') in ('yes', 'no')]
+    if not resolved:
+        print("No resolved entries found")
+        return {}
+
+    print("\n=== WEATHER FORECAST CALIBRATION REPORT ===")
+    print("Resolved entries: %d" % len(resolved))
+    print()
+
+    # ── 1. Model prob bucket calibration ──
+    buckets = defaultdict(list)
+    for e in resolved:
+        mp = e.get('model_prob', 0)
+        result = e.get('market_result', 'no')
+        bucket = int(mp * 10) * 10  # 0, 10, 20, ... 90
+        bucket = min(bucket, 90)
+        buckets[bucket].append(1 if result == 'yes' else 0)
+
+    print("── Model Probability Calibration ──")
+    print("%-12s  %6s  %7s  %7s  %10s" % ("Bucket", "N", "Expected", "Actual", "Cal Error"))
+    print("-" * 52)
+    cal_data = []
+    for b in range(0, 100, 10):
+        vals = buckets.get(b, [])
+        n = len(vals)
+        expected = (b + 5) / 100.0
+        actual = sum(vals) / n if n > 0 else float('nan')
+        cal_err = actual - expected if n > 0 else float('nan')
+        label = "%d-%d%%" % (b, b + 10)
+        if n > 0:
+            print("%-12s  %6d  %7.1f%%  %7.1f%%  %+10.1f%%" % (
+                label, n, expected * 100, actual * 100, cal_err * 100))
+        else:
+            print("%-12s  %6d  %7.1f%%  %7s  %10s" % (label, n, expected * 100, "—", "—"))
+        cal_data.append({'bucket': label, 'n': n, 'expected': expected,
+                         'actual': actual if n > 0 else None,
+                         'cal_error': cal_err if n > 0 else None})
+    print()
+
+    # ── 2. Win rate by direction ──
+    dir_stats = defaultdict(lambda: {'n': 0, 'wins': 0})
+    for e in resolved:
+        direction = e.get('direction', 'UNKNOWN')
+        result = e.get('market_result', 'no')
+        trade_status = e.get('trade_status', '')
+        dir_stats[direction]['n'] += 1
+        if trade_status == 'WIN':
+            dir_stats[direction]['wins'] += 1
+
+    print("── Win Rate by Direction ──")
+    print("%-8s  %6s  %6s  %7s" % ("Dir", "N", "Wins", "Win%"))
+    print("-" * 30)
+    dir_data = {}
+    for direction in ('YES', 'NO'):
+        s = dir_stats.get(direction, {'n': 0, 'wins': 0})
+        n = s['n']
+        wins = s['wins']
+        pct = wins / n * 100 if n > 0 else 0
+        print("%-8s  %6d  %6d  %6.1f%%" % (direction, n, wins, pct))
+        dir_data[direction] = {'n': n, 'wins': wins, 'win_pct': pct}
+    print()
+
+    # ── 3. Win rate by edge bucket ──
+    edge_buckets = defaultdict(lambda: {'n': 0, 'wins': 0})
+    for e in resolved:
+        edge = abs(e.get('edge', 0))
+        ts = e.get('trade_status', '')
+        if edge < 0.15:
+            label = '<15c'
+        elif edge < 0.25:
+            label = '15-25c'
+        elif edge < 0.35:
+            label = '25-35c'
+        else:
+            label = '>35c'
+        edge_buckets[label]['n'] += 1
+        if ts == 'WIN':
+            edge_buckets[label]['wins'] += 1
+
+    print("── Win Rate by Edge Bucket ──")
+    print("%-8s  %6s  %6s  %7s" % ("Edge", "N", "Wins", "Win%"))
+    print("-" * 30)
+    edge_data = {}
+    for label in ('<15c', '15-25c', '25-35c', '>35c'):
+        s = edge_buckets.get(label, {'n': 0, 'wins': 0})
+        n = s['n']
+        wins = s['wins']
+        pct = wins / n * 100 if n > 0 else 0
+        print("%-8s  %6d  %6d  %6.1f%%" % (label, n, wins, pct))
+        edge_data[label] = {'n': n, 'wins': wins, 'win_pct': pct}
+    print()
+
+    # ── 4. Best performing cities ──
+    city_stats = defaultdict(lambda: {'n': 0, 'wins': 0})
+    for e in resolved:
+        city = e.get('city_name', 'Unknown')
+        ts = e.get('trade_status', '')
+        city_stats[city]['n'] += 1
+        if ts == 'WIN':
+            city_stats[city]['wins'] += 1
+
+    print("── City Performance ──")
+    print("%-20s  %6s  %6s  %7s" % ("City", "N", "Wins", "Win%"))
+    print("-" * 42)
+    city_list = []
+    for city, s in sorted(city_stats.items(), key=lambda x: -(x[1]['wins'] / x[1]['n'] if x[1]['n'] > 0 else 0)):
+        n = s['n']
+        wins = s['wins']
+        pct = wins / n * 100 if n > 0 else 0
+        print("%-20s  %6d  %6d  %6.1f%%" % (city, n, wins, pct))
+        city_list.append({'city': city, 'n': n, 'wins': wins, 'win_pct': round(pct, 1)})
+    print()
+
+    # ── Summary ──
+    total_n = len(resolved)
+    total_wins = sum(1 for e in resolved if e.get('trade_status') == 'WIN')
+    print("── Overall: %d/%d wins (%.1f%%) ──" % (total_wins, total_n, total_wins / total_n * 100 if total_n > 0 else 0))
+
+    # Save report
+    report = {
+        'generated_at': datetime.now(timezone.utc).isoformat(),
+        'total_resolved': total_n,
+        'total_wins': total_wins,
+        'overall_win_pct': round(total_wins / total_n * 100 if total_n > 0 else 0, 1),
+        'calibration_by_bucket': cal_data,
+        'win_rate_by_direction': dir_data,
+        'win_rate_by_edge': edge_data,
+        'city_performance': city_list,
+    }
+    report_path = os.path.join(DATA_DIR, 'calibration_report.json')
+    try:
+        with open(report_path, 'w') as f:
+            json.dump(report, f, indent=2)
+        print("Report saved to %s" % report_path)
+    except Exception as e:
+        print("Failed to save report: %s" % e)
+
+    return report
+
 
 
 def main():

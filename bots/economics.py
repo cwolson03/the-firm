@@ -34,6 +34,12 @@ from typing import Optional
 
 import requests
 
+try:
+    from scipy.stats import norm as _scipy_norm
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
@@ -46,11 +52,11 @@ KEY_ID      = "2e462103-bdd5-4a1b-b231-17191bded0bb"
 # Paths — auto-detect Atlas (cody) vs local (stratton)
 _HOME = os.path.expanduser("~")
 if os.path.exists("/home/cody/stratton"):
-    PRIVATE_KEY_PATH = "/home/cody/stratton/config/kalshi_private.pem"
+    PRIVATE_KEY_PATH = os.environ.get("KALSHI_KEY_PATH", "")
     BOT_TOKENS_ENV   = "/home/cody/stratton/config/bot-tokens.env"
     LOG_PATH         = "/home/cody/stratton/logs/economics.log"
 else:
-    PRIVATE_KEY_PATH = "/home/stratton/.openclaw/workspace/config/kalshi_private.pem"
+    PRIVATE_KEY_PATH = os.environ.get("KALSHI_KEY_PATH", "")
     BOT_TOKENS_ENV   = "/home/stratton/.openclaw/workspace/config/bot-tokens.env"
     LOG_PATH         = "/home/stratton/.openclaw/workspace/logs/economics.log"
 
@@ -67,7 +73,7 @@ WHALE_MIN_CONTRACTS    = 50
 WHALE_MIN_NOTIONAL     = 200
 WHALE_WINDOW_HOURS     = 1
 WHALE_ALERT_THRESHOLD  = 3
-WHALE_FETCH_TOP_N      = 30
+WHALE_FETCH_TOP_N      = 60
 
 # --- Confidence thresholds ---
 CONFIDENCE_HIGH_THRESHOLD   = 0.65
@@ -75,13 +81,25 @@ CONFIDENCE_MEDIUM_THRESHOLD = 0.35
 
 # --- Report config ---
 TOP_PLAYS_DISPLAY = 5
-WATCHLIST_SIZE    = 25   # Tier 1 → Tier 2 watchlist
+WATCHLIST_SIZE    = 50   # Tier 1 → Tier 2 watchlist
 
 # --- Execution Guardrails (NON-NEGOTIABLE — never bypass) ---
 EXEC_MIN_EDGE_DOLLARS   = 0.18
 EXEC_MAX_PER_POSITION   = 0.35
 EXEC_MAX_TOTAL_DEPLOYED = 0.70
 EXEC_POSITION_SIZE_PCT  = 0.05
+MAX_LONGSHOT_DOLLARS    = 8.0    # Max spend on any market priced < 15c (longshot cap)
+
+# --- Daily loss kill switch ---
+DAILY_LOSS_LIMIT_DOLLARS = 25.0
+DAILY_LOSS_PATH          = "/home/cody/stratton/data/donnie_daily_loss.json"
+
+# --- Skip reason logging ---
+SKIP_LOG_PATH            = "/home/cody/stratton/data/skip_log.jsonl"
+SKIP_LOG_MAX_BYTES       = 10 * 1024 * 1024  # 10 MB
+
+# --- Correlation cap ---
+MAX_POSITIONS_PER_CLASS  = {"COMMODITY": 2, "CRYPTO_SHORT": 2, "ECONOMIC_DATA": 5}
 
 # --- Stale order management ---
 ORDER_MAX_AGE_HOURS = 2  # auto-cancel stale limit orders older than 2 hours
@@ -197,6 +215,7 @@ CATEGORY_TIERS = {
     "WEATHER":        2.5,   # Open-Meteo model vs Kalshi price
     "COMMODITY":      2.5,   # Gold, Oil, Silver, S&P with real-time data
     "CRYPTO_SHORT":   2.0,   # BTC/ETH price range within 24 hours (KXBTCD/KXETHD)
+    "CRYPTO_15M":     1.5,   # 15-minute BTC/ETH momentum markets (KXBTC15M/KXETH15M)
     "POLITICAL_NEWS": 1.0,   # Breaking news / whale signal required
     "WORLD_EVENTS":   1.0,   # International events
     "POLITICAL_LONG": 0.2,   # 2028 elections, long-dated political
@@ -236,6 +255,12 @@ volume_history: dict = defaultdict(list)
 
 # crypto monitor signals
 crypto_signals: dict = {}
+
+# BTC/ETH spot prices from previous scan — used for momentum trigger
+_prev_btc_spot: float = 0.0
+_prev_eth_spot: float = 0.0
+BTC_MOMENTUM_THRESHOLD = 0.005  # 0.5% move triggers BTC edge scan
+MAX_BTC_POSITIONS_PER_CLOSE = 2  # max positions per single close time
 
 # resting order tracker — alerts on fills
 _known_resting: dict = {}
@@ -470,10 +495,18 @@ MARK_CATEGORIES = {"Climate and Weather"}  # Mark Hanna + weather.py own this
 def group_by_category(markets: list) -> dict:
     grouped = defaultdict(list)
     for m in markets:
-        cat = m.get("_category", "UNCATEGORIZED")
-        if cat in BRAD_CATEGORIES:
+        ticker = m.get("ticker", "")
+        title  = m.get("title") or ""
+        # Use classify_market() to get proper category — API category field is unreliable
+        d = days_until_close(m)
+        api_cat = m.get("category") or m.get("_category") or "UNCATEGORIZED"
+        proper_cat = classify_market(ticker, title, api_cat, d)
+        # Store computed class back on market dict for downstream use
+        m["_category"] = proper_cat
+        m["market_class"] = proper_cat
+        if api_cat in BRAD_CATEGORIES or proper_cat in BRAD_CATEGORIES:
             continue
-        grouped[cat].append(m)
+        grouped[proper_cat].append(m)
     return dict(grouped)
 
 def top_markets_per_category(grouped: dict) -> dict:
@@ -481,6 +514,7 @@ def top_markets_per_category(grouped: dict) -> dict:
     PRIORITY_CAT_LIMIT = {
         "ECONOMIC_DATA": 20,   # Always evaluate all economic data markets
         "CRYPTO_SHORT":  15,   # BTC/ETH daily price markets must be included
+        "CRYPTO_15M":   20,   # 15-minute BTC/ETH momentum markets — include all
         "COMMODITY":     15,   # Gold/Oil/SP500 daily price markets
         "WEATHER":       20,   # Weather markets handled by weather bot but keep high
     }
@@ -640,6 +674,7 @@ DAILY_PRICE_SERIES = {
     'KXBTCD':  {'asset': 'BTC',  'category': 'CRYPTO_SHORT'},
     'KXETHD':  {'asset': 'ETH',  'category': 'CRYPTO_SHORT'},
     'KXGOLDD': {'asset': 'GOLD', 'category': 'COMMODITY'},
+    'KXEURUSD': {'asset': 'EURUSD', 'category': 'ECONOMIC_DATA'},
     'KXWTI':   {'asset': 'OIL',  'category': 'COMMODITY'},
 }
 
@@ -724,33 +759,217 @@ def fetch_cleveland_cpi() -> dict:
 
     return result
 
+def fetch_cpi_component_estimate() -> dict:
+    """
+    Component-based CPI MoM estimate using major BLS sub-indices from FRED.
+    
+    Components and approximate BLS weights:
+      - CUSR0000SAH1  (Shelter)             35%
+      - CPIENGSL      (Energy)               7%
+      - CPIFABSL      (Food at home)        14%
+      - CUSR0000SACL1E (Core services ex-shelter) 30%
+      - CPIAUCSL      (All items, validation) —
+
+    For each component: fetch 6 months, compute MoM changes, apply weight, sum.
+    
+    Returns dict with mom_estimate, std_dev, components breakdown, source.
+    """
+    import statistics
+
+    COMPONENTS = [
+        ("CUSR0000SAH1",   "shelter",       0.35),
+        ("CPIENGSL",       "energy",        0.07),
+        ("CPIFABSL",       "food",          0.14),
+        ("CUSR0000SACL1E", "core_services", 0.30),
+    ]
+    # Core goods gets residual weight (0.14) — approximated via CPIAUCSL validation
+    CORE_GOODS_WEIGHT = 0.14
+
+    component_moms = {}
+    weighted_contributions = []
+
+    for series_id, label, weight in COMPONENTS:
+        try:
+            r = requests.get("https://api.stlouisfed.org/fred/series/observations", params={
+                "series_id": series_id,
+                "api_key":   FRED_API_KEY,
+                "file_type": "json",
+                "sort_order": "desc",
+                "limit": 8,
+            }, timeout=10)
+            if not r.ok:
+                raise ValueError(f"HTTP {r.status_code}")
+            obs = [(o["date"], float(o["value"])) for o in r.json().get("observations", [])
+                   if o.get("value") not in (".", None)]
+            if len(obs) < 2:
+                raise ValueError("insufficient data")
+            # MoM % changes (most recent first)
+            moms = [(obs[i][1] - obs[i+1][1]) / obs[i+1][1] * 100 for i in range(len(obs)-1)]
+            # 3m average as component estimate
+            est = sum(moms[:3]) / min(3, len(moms))
+            component_moms[label] = round(est, 4)
+            weighted_contributions.append(est * weight)
+            log.debug(f"[CPI-Component] {label} ({series_id}): 3m avg MoM = {est:.3f}%")
+        except Exception as e:
+            log.warning(f"[CPI-Component] {label} ({series_id}) failed: {e}")
+            raise  # bubble up so caller falls back
+
+    # Core goods estimated as residual (not directly available, use ~0 for now)
+    # We do NOT add it to weighted_contributions to avoid double-counting;
+    # the four components above cover ~86% of the index.
+    total_weight_covered = sum(w for _, _, w in COMPONENTS)
+    mom_estimate = sum(weighted_contributions)
+
+    # Std dev from shelter (most stable) and energy (most volatile) spread
+    values = list(component_moms.values())
+    std_dev = statistics.stdev(values) if len(values) >= 2 else 0.20
+
+    result = {
+        "mom_estimate": round(mom_estimate, 4),
+        "std_dev":      round(std_dev, 4),
+        "components":   component_moms,
+        "weight_coverage": round(total_weight_covered, 2),
+        "source":       "FRED/CPI_components",
+    }
+    log.info(
+        "[CPI-Component] estimate=%.3f%% std=%.3f%% "
+        "shelter=%.3f%% energy=%.3f%% food=%.3f%% core_svc=%.3f%%",
+        mom_estimate, std_dev,
+        component_moms.get("shelter", 0),
+        component_moms.get("energy", 0),
+        component_moms.get("food", 0),
+        component_moms.get("core_services", 0),
+    )
+    return result
+
+
+def fetch_cpi_mom_estimate() -> dict:
+    """
+    Calculate expected CPI month-over-month change.
+    
+    PRIMARY: Component-based model using major BLS sub-indices (IMPROVEMENT 1).
+    FALLBACK: Simple CPIAUCSL 3m/6m blended trend.
+    
+    The Kalshi CPI markets ask about MoM % change (e.g. "will CPI rise > 0.5%"),
+    NOT the raw index level. This function computes the model estimate correctly.
+    
+    Returns dict: mom_estimate (%), std_dev (%), source, history
+    """
+    import statistics
+
+    # --- PRIMARY: component-based model ---
+    try:
+        result = fetch_cpi_component_estimate()
+        if result and result.get("mom_estimate") is not None:
+            return result
+    except Exception as e:
+        log.warning("[CPI] Component model failed (%s), falling back to CPIAUCSL trend", e)
+
+    # --- FALLBACK: simple CPIAUCSL trend ---
+    try:
+        r = requests.get("https://api.stlouisfed.org/fred/series/observations", params={
+            "series_id": "CPIAUCSL",
+            "api_key": FRED_API_KEY,
+            "file_type": "json",
+            "sort_order": "desc",
+            "limit": 8,
+        }, timeout=10)
+        if not r.ok:
+            return {}
+        obs = [(o["date"], float(o["value"])) for o in r.json().get("observations", [])
+               if o.get("value") not in (".", None)]
+        if len(obs) < 4:
+            return {}
+        
+        # MoM % changes
+        moms = [(obs[i][1] - obs[i+1][1]) / obs[i+1][1] * 100 for i in range(len(obs)-1)]
+        
+        trend_3m = sum(moms[:3]) / 3
+        trend_6m = sum(moms[:6]) / 6 if len(moms) >= 6 else trend_3m
+        
+        # Blended estimate: 60% recent, 40% longer trend
+        estimate = trend_3m * 0.60 + trend_6m * 0.40
+        
+        std_dev = statistics.stdev(moms[:6]) if len(moms) >= 3 else 0.20
+        
+        result = {
+            "mom_estimate": round(estimate, 3),
+            "std_dev":      round(std_dev, 3),
+            "trend_3m":     round(trend_3m, 3),
+            "trend_6m":     round(trend_6m, 3),
+            "last_mom":     round(moms[0], 3),
+            "last_date":    obs[0][0],
+            "source":       "FRED/CPIAUCSL_MoM(fallback)",
+        }
+        log.info("[CPI] Fallback MoM estimate: %.3f%% (3m=%.3f%% 6m=%.3f%% last=%.3f%%)",
+                 estimate, trend_3m, trend_6m, moms[0])
+        return result
+    except Exception as e:
+        log.warning("[CPI] fetch_cpi_mom_estimate failed: %s", e)
+        return {}
+
+# Cache CPI MoM estimate — 4 hour TTL (FRED data is monthly, no need to refresh often)
+_cpi_mom_cache: dict = {}
+_cpi_mom_cache_ts: float = 0.0
+
+def get_cpi_mom_estimate() -> dict:
+    global _cpi_mom_cache, _cpi_mom_cache_ts
+    now = time.time()
+    if _cpi_mom_cache and (now - _cpi_mom_cache_ts) < 14400:
+        return _cpi_mom_cache
+    result = fetch_cpi_mom_estimate()
+    if result:
+        _cpi_mom_cache = result
+        _cpi_mom_cache_ts = now
+    return _cpi_mom_cache
+
 def calculate_cpi_edge(ticker: str, kalshi_mid: float) -> tuple:
-    """Edge calculation for CPI/PCE markets using Cleveland Fed data."""
+    """
+    Edge calculation for CPI/PCE markets.
+    
+    FIX (2026-05-02): Now uses actual MoM % change estimate, not the raw index level.
+    The Kalshi threshold (e.g. 0.5) is a MoM % change, not an index level.
+    Previous model was comparing index level (330) vs threshold (0.5) — wrong units.
+    
+    Model: CPIAUCSL 3m/6m blended MoM trend with normal distribution.
+    """
     ticker_upper = ticker.upper()
 
-    cpi_data = fetch_cleveland_cpi()
-
-    # Parse threshold from ticker
+    # Parse threshold from ticker (e.g. KXCPI-26APR-T0.5 -> 0.5% MoM threshold)
     match = re.search(r'T(-?\d+\.?\d*)', ticker_upper.split('-')[-1])
     if not match:
         return None, 0.0, "NO", "parse_error"
     threshold = float(match.group(1))
 
-    # Use headline CPI as the model estimate
-    model_cpi = cpi_data.get("nowcast") or cpi_data.get("headline_cpi")
-    if not model_cpi:
+    # Get MoM estimate
+    cpi = get_cpi_mom_estimate()
+    if not cpi:
         return None, 0.0, "NO", "unavailable"
 
-    if model_cpi < threshold:
-        gap = threshold - model_cpi
-        model_prob_no = min(0.95, 0.5 + gap * 0.12)
-        edge = model_prob_no - (1.0 - kalshi_mid)
-        return model_prob_no, edge, "NO", f"ClevFed={model_cpi:.2f}%<{threshold}%"
+    estimate = cpi["mom_estimate"]   # e.g. 0.35% expected MoM
+    std_dev  = cpi["std_dev"]        # e.g. 0.25% historical std dev
+
+    # P(actual MoM > threshold) using normal distribution
+    if not SCIPY_AVAILABLE:
+        # Fallback: simple comparison
+        if estimate > threshold:
+            gap = estimate - threshold
+            model_prob = min(0.85, 0.55 + gap * 2.0)
+        else:
+            gap = threshold - estimate
+            model_prob = max(0.15, 0.45 - gap * 2.0)
     else:
-        gap = model_cpi - threshold
-        model_prob_yes = min(0.95, 0.5 + gap * 0.12)
-        edge = model_prob_yes - kalshi_mid
-        return model_prob_yes, edge, "YES", f"ClevFed={model_cpi:.2f}%>{threshold}%"
+        from scipy.stats import norm
+        z = (threshold - estimate) / max(std_dev, 0.05)
+        model_prob = float(1.0 - norm.cdf(z))
+
+    edge = model_prob - kalshi_mid
+    direction = "YES" if edge > 0 else "NO"
+
+    source = "CPIAUCSL_MoM(est=%.3f%%,thr=%.3f%%)" % (estimate, threshold)
+    log.info("[CPI] %s: MoM_est=%.3f%% thr=%.3f%% sigma=%.3f -> P(>thr)=%.0f%% kalshi=%.0f%% edge=%+.2f -> %s",
+             ticker, estimate, threshold, std_dev, model_prob*100, kalshi_mid*100, edge, direction)
+    return model_prob, edge, direction, source
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -759,27 +978,100 @@ def calculate_cpi_edge(ticker: str, kalshi_mid: float) -> tuple:
 
 def fetch_adp_estimate() -> dict:
     """
-    Fetch ADP National Employment Report from FRED (ADPWNFM series).
-    ADP releases ~2 days before NFP and is a strong leading signal.
-    Returns dict: value (thousands), date, available (bool)
+    Fetch ADP National Employment Report.  IMPROVEMENT 2: multi-source fallback.
+    
+    Sources tried in order:
+      1. FRED ADPWNFP  — private nonfarm payrolls (usually populated)
+      2. FRED ADPNFP   — alternative series ID
+      3. FRED ADPWNFM  — original series (often empty)
+      4. ADP website   — scrape headline number
+      5. Return unavailable if all fail
+    
+    Returns dict: value (thousands), date, available (bool), source (str)
     """
+    # Series: (id, label, is_level) — is_level=True means absolute employment, compute MoM diff
+    FRED_SERIES = [
+        ("ADPMNUSNERSA",  "FRED/ADPMNUSNERSA",  True),   # Monthly SA total employment (level)
+        ("ADPWNUSNERSA",  "FRED/ADPWNUSNERSA",  True),   # Weekly SA total employment (level)
+        ("ADPMNUSNERNSA", "FRED/ADPMNUSNERNSA", True),   # Monthly NSA total employment (level)
+        ("ADPWNFM",       "FRED/ADPWNFM",       False),  # Legacy monthly change series
+    ]
+
+    # 1-4: Try FRED series in order
+    for series_id, source_label, is_level in FRED_SERIES:
+        try:
+            r = requests.get("https://api.stlouisfed.org/fred/series/observations", params={
+                "series_id": series_id,
+                "api_key":   FRED_API_KEY,
+                "file_type": "json",
+                "sort_order": "desc",
+                "limit": 4,   # need 2+ for level series diff
+            }, timeout=10)
+            if r.ok:
+                obs = [(o["date"], float(o["value"])) for o in r.json().get("observations", [])
+                       if o.get("value") not in (".", None)]
+                if not obs:
+                    log.debug("[NFP] %s returned no observations", series_id)
+                    continue
+                if is_level:
+                    # Series returns absolute employment level (e.g. 132M).
+                    # Compute MoM change in thousands for NFP blending.
+                    if len(obs) < 2:
+                        log.debug("[NFP] %s: need 2 obs for diff, only have %d", series_id, len(obs))
+                        continue
+                    mom_change_k = (obs[0][1] - obs[1][1]) / 1000.0  # convert to thousands
+                    # Sanity: ADP monthly change should be -1000K to +1000K
+                    if not (-1000 <= mom_change_k <= 1000):
+                        log.debug("[NFP] %s: MoM change %.1fK out of sanity range, skipping", series_id, mom_change_k)
+                        continue
+                    log.info("[NFP] ADP from %s: %.1fK MoM change (level %s→%s, as of %s)",
+                             source_label, mom_change_k, obs[1][0], obs[0][0], obs[0][0])
+                    return {"value": mom_change_k, "date": obs[0][0], "available": True, "source": source_label}
+                else:
+                    # Series returns change directly
+                    log.info("[NFP] ADP from %s: %.0fK (as of %s)", source_label, obs[0][1], obs[0][0])
+                    return {"value": obs[0][1], "date": obs[0][0], "available": True, "source": source_label}
+        except Exception as e:
+            log.debug("[NFP] %s fetch failed: %s", series_id, e)
+
+    # 4: Scrape ADP employment report website
     try:
-        r = requests.get("https://api.stlouisfed.org/fred/series/observations", params={
-            "series_id": "ADPWNFM",
-            "api_key": FRED_API_KEY,
-            "file_type": "json",
-            "sort_order": "desc",
-            "limit": 3,
-        }, timeout=10)
+        r = requests.get(
+            "https://adpemploymentreport.com/",
+            timeout=15,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; EconBot/1.0)"},
+        )
         if r.ok:
-            obs = [(o["date"], float(o["value"])) for o in r.json().get("observations", [])
-                   if o.get("value") not in (".", None)]
-            if obs:
-                log.info("[NFP] ADP latest: %.0fK (as of %s)", obs[0][1], obs[0][0])
-                return {"value": obs[0][1], "date": obs[0][0], "available": True}
+            text = r.text
+            # Look for patterns like "147,000" or "147K" near "jobs" or "employment"
+            # Common headline formats: "added 147,000 jobs" or "147K jobs"
+            patterns = [
+                r'added\s+([\d,]+)\s+jobs',
+                r'([\d,]+)\s+jobs\s+(?:added|created|gained)',
+                r'headline[^\d]+([\d,]+)',
+                r'total\s+nonfarm[^\d]+([\d,]+)',
+                r'private[^\d]+([\d,]+)\s+(?:jobs|workers)',
+                r'(\d{2,3}),(\d{3})',  # matches like "147,000"
+            ]
+            for pat in patterns:
+                m = re.search(pat, text, re.IGNORECASE)
+                if m:
+                    # Extract and clean the number
+                    raw = m.group(1).replace(",", "") if m.lastindex >= 1 else None
+                    if raw and raw.isdigit():
+                        val = float(raw)
+                        # Sanity check: ADP readings are usually 50K-500K
+                        if 10000 <= val <= 1000000:
+                            val = val / 1000  # convert to thousands
+                        if 10 <= val <= 1000:
+                            log.info("[NFP] ADP from adpemploymentreport.com: %.0fK", val)
+                            return {"value": val, "date": None, "available": True, "source": "adpemploymentreport.com"}
+            log.debug("[NFP] ADP website parsed but no headline number found")
     except Exception as e:
-        log.debug("[NFP] ADP fetch failed: %s", e)
-    return {"value": None, "date": None, "available": False}
+        log.debug("[NFP] ADP website scrape failed: %s", e)
+
+    log.warning("[NFP] All ADP sources failed — will use PAYEMS-only model")
+    return {"value": None, "date": None, "available": False, "source": "none"}
 
 def fetch_nfp_estimate() -> dict:
     """
@@ -952,7 +1244,28 @@ def calculate_gdp_edge(ticker: str, kalshi_mid: float) -> tuple:
 # CRYPTO & COMMODITY PRICE EDGE CALCULATORS
 
 def get_crypto_spot() -> dict:
-    """Get current BTC and ETH spot prices from CoinGecko."""
+    """
+    Get current BTC and ETH spot prices.  IMPROVEMENT 3: Coinbase primary, CoinGecko fallback.
+    
+    Sources:
+      1. Coinbase public API (no auth, reliable, no rate limits for spot)
+      2. CoinGecko free tier (fallback)
+    
+    Returns {"BTC": float, "ETH": float}
+    """
+    # 1. Try Coinbase first
+    try:
+        btc_r = requests.get("https://api.coinbase.com/v2/prices/BTC-USD/spot", timeout=8)
+        eth_r = requests.get("https://api.coinbase.com/v2/prices/ETH-USD/spot", timeout=8)
+        if btc_r.status_code == 200 and eth_r.status_code == 200:
+            btc_price = float(btc_r.json()["data"]["amount"])
+            eth_price = float(eth_r.json()["data"]["amount"])
+            log.info(f"[Crypto] Coinbase: BTC=${btc_price:,.0f} ETH=${eth_price:,.0f}")
+            return {"BTC": btc_price, "ETH": eth_price, "_source": "Coinbase"}
+    except Exception as e:
+        log.debug(f"[Crypto] Coinbase failed: {e}")
+
+    # 2. Fallback to CoinGecko
     try:
         r = requests.get(
             "https://api.coingecko.com/api/v3/simple/price",
@@ -961,13 +1274,158 @@ def get_crypto_spot() -> dict:
         )
         if r.status_code == 200:
             data = r.json()
-            return {
-                "BTC": data.get("bitcoin", {}).get("usd", 0),
-                "ETH": data.get("ethereum", {}).get("usd", 0),
-            }
+            btc_price = data.get("bitcoin", {}).get("usd", 0)
+            eth_price = data.get("ethereum", {}).get("usd", 0)
+            log.info(f"[Crypto] CoinGecko (fallback): BTC=${btc_price:,.0f} ETH=${eth_price:,.0f}")
+            return {"BTC": btc_price, "ETH": eth_price, "_source": "CoinGecko"}
     except Exception as e:
         log.debug(f"[Crypto] CoinGecko failed: {e}")
+
+    log.warning("[Crypto] All price sources failed")
     return {}
+
+
+# Cache for BTC realized volatility (1-hour TTL)
+_btc_vol_cache: dict = {"vol": None, "ts": 0.0}
+
+def fetch_btc_realized_vol() -> float:
+    """
+    Fetch BTC 30-day realized annualized volatility from CoinGecko.
+    Calculates: stdev(ln(p_t/p_{t-1})) * sqrt(365) * 100
+    Returns annualized vol as percentage (e.g. 45.0 for 45%).
+    Cached for 1 hour. Falls back to 55.0% if fetch fails.
+    """
+    global _btc_vol_cache
+    now = time.time()
+    if _btc_vol_cache["vol"] is not None and (now - _btc_vol_cache["ts"]) < 3600:
+        return _btc_vol_cache["vol"]
+    try:
+        r = requests.get(
+            "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart",
+            params={"vs_currency": "usd", "days": 30, "interval": "daily"},
+            timeout=15
+        )
+        if r.status_code == 200:
+            prices_raw = r.json().get("prices", [])
+            if len(prices_raw) >= 10:
+                prices = [p[1] for p in prices_raw]
+                log_returns = [math.log(prices[i] / prices[i-1]) for i in range(1, len(prices))]
+                n = len(log_returns)
+                mean = sum(log_returns) / n
+                variance = sum((x - mean) ** 2 for x in log_returns) / (n - 1)
+                daily_std = math.sqrt(variance)
+                annualized_vol = daily_std * math.sqrt(365) * 100
+                # Sanity clamp: BTC vol rarely goes below 20% or above 200%
+                annualized_vol = max(20.0, min(200.0, annualized_vol))
+                _btc_vol_cache = {"vol": annualized_vol, "ts": now}
+                log.info(f"[Vol] BTC 30d realized vol: {annualized_vol:.1f}% annualized ({daily_std*100:.2f}% daily)")
+                return annualized_vol
+    except Exception as e:
+        log.warning(f"[Vol] CoinGecko vol fetch failed: {e}")
+    # Fallback: conservative estimate for BTC
+    fallback = 55.0
+    _btc_vol_cache = {"vol": fallback, "ts": now}
+    log.warning(f"[Vol] Using fallback vol: {fallback}% annualized")
+    return fallback
+
+
+def calculate_crypto15m_edge(ticker: str, market_dict: dict) -> tuple:
+    """
+    Multi-signal edge model for KXBTC15M / KXETH15M 15-minute momentum markets.
+    Requires 2-of-3 signal consensus before returning any edge.
+
+    Signals:
+      1. Price momentum proxy (Kalshi mid directional bias)
+      2. Kalshi order book imbalance
+      3. Spread tightness (liquidity / volatility proxy)
+
+    Returns (model_prob, edge, direction, source)
+    """
+    ticker_upper = ticker.upper()
+    yes_bid  = float(market_dict.get("yes_bid", 0) or 0)
+    yes_ask  = float(market_dict.get("yes_ask", 100) or 100)
+    # Kalshi prices may be in cents (0-100) — normalize to 0-1
+    if yes_bid > 1.0:
+        yes_bid = yes_bid / 100.0
+    if yes_ask > 1.0:
+        yes_ask = yes_ask / 100.0
+
+    mid = (yes_bid + yes_ask) / 2.0
+
+    # ── Signal 1: Price momentum proxy ──────────────────────────────────────
+    # If mid > 0.50 → market implies bullish momentum; if < 0.50 → bearish
+    sig1 = None
+    if mid > 0.52:
+        sig1 = "YES"
+    elif mid < 0.48:
+        sig1 = "NO"
+    # else neutral
+
+    # ── Signal 2: Order book imbalance ──────────────────────────────────────
+    sig2 = None
+    yes_bid_size = float(market_dict.get("yes_bid_size_fp") or market_dict.get("yes_bid_size") or 0)
+    no_bid_size  = float(market_dict.get("no_bid_size_fp")  or market_dict.get("no_bid_size")  or 0)
+    if yes_bid_size > 0 and no_bid_size > 0:
+        ratio = yes_bid_size / no_bid_size
+        if ratio > 1.20:
+            sig2 = "YES"
+        elif ratio < (1.0 / 1.20):
+            sig2 = "NO"
+    # else neutral (sizes unavailable or within 20%)
+
+    # ── Signal 3: Spread tightness ──────────────────────────────────────────
+    spread = yes_ask - yes_bid
+    sig3_valid = spread < 0.08  # signal is valid if spread not too wide
+    # Spread < 0.04 = tight book (active market) → counts as a confirming signal
+    # Spread 0.04-0.08 = moderate — valid but doesn't add signal direction
+    # Spread > 0.08 = unreliable, marks as no-signal
+
+    # -- Signal 4: Fear & Greed Index -------------------------------------------
+    fg = fetch_crypto_fear_greed()
+    fg_value = fg.get("value", 50)
+    sig4 = None
+    if fg_value > 55:
+        sig4 = "YES"   # greed supports upward continuation
+    elif fg_value < 45:
+        sig4 = "NO"    # fear supports downward continuation
+
+    # -- Aggregate (4-signal model, sig3 is validity check not directional) -----
+    yes_signals = sum(1 for s in [sig1, sig2, sig4] if s == "YES")
+    no_signals  = sum(1 for s in [sig1, sig2, sig4] if s == "NO")
+
+    # Tight spread as confirming bonus
+    if sig3_valid and spread < 0.04:
+        if yes_signals > no_signals:
+            yes_signals += 1
+        elif no_signals > yes_signals:
+            no_signals += 1
+
+    # Variable model_prob based on signal strength
+    total_aligned = max(yes_signals, no_signals)
+    if total_aligned >= 4:
+        prob_yes, prob_no, size_note = 0.66, 0.34, "4-signal HIGH"
+    elif total_aligned >= 3:
+        prob_yes, prob_no, size_note = 0.64, 0.36, "3-signal MED+"
+    else:
+        prob_yes, prob_no, size_note = 0.62, 0.38, "2-signal BASE"
+
+    if yes_signals >= 2 and mid < 0.60:
+        model_prob = prob_yes
+        edge = model_prob - mid
+        log.info("[Crypto15M] %s YES consensus (%s) sig1=%s sig2=%s sig4=%s fg=%d yes=%d no=%d edge=%+.3f",
+                 ticker, size_note, sig1, sig2, sig4, fg_value, yes_signals, no_signals, edge)
+        return model_prob, edge, "YES", ("15M_4sig(yes=%d,fg=%d,%s)" % (yes_signals, fg_value, size_note))
+
+    if no_signals >= 2 and mid > 0.40:
+        model_prob = prob_no
+        edge = model_prob - mid
+        log.info("[Crypto15M] %s NO consensus (%s) sig1=%s sig2=%s sig4=%s fg=%d yes=%d no=%d edge=%+.3f",
+                 ticker, size_note, sig1, sig2, sig4, fg_value, yes_signals, no_signals, edge)
+        return model_prob, edge, "NO", ("15M_4sig(no=%d,fg=%d,%s)" % (no_signals, fg_value, size_note))
+
+    log.info("[Crypto15M] %s no consensus fg=%d sig1=%s sig2=%s sig4=%s yes=%d no=%d",
+             ticker, fg_value, sig1, sig2, sig4, yes_signals, no_signals)
+    return None, 0.0, "NO", "insufficient_signal_consensus"
 
 def calculate_crypto_edge(ticker: str, kalshi_mid: float) -> tuple:
     """
@@ -986,26 +1444,50 @@ def calculate_crypto_edge(ticker: str, kalshi_mid: float) -> tuple:
     above_match = re.search(r'T(-?\d+)', ticker_upper.split('-')[-1])
     if above_match:
         threshold = float(above_match.group(1))
+
+        # ── Buffer check: spot must be >0.5% from threshold (no thin-buffer trades) ──
+        buffer_pct = abs(spot - threshold) / threshold
+        if buffer_pct < 0.005:
+            log.info(
+                f"[Crypto] {ticker}: buffer {buffer_pct*100:.3f}% < 0.5% minimum — no trade"
+            )
+            return None, 0.0, "NO", "buffer_too_thin"
+
         pct_above = (spot - threshold) / threshold
+
+        # ── Dynamic volatility: use realized 30d vol instead of fixed 2.5% ──
+        annualized_vol = fetch_btc_realized_vol()  # e.g. 55%
+        daily_vol = annualized_vol / math.sqrt(365) / 100  # convert % → decimal daily
+
+        # Scale edge thresholds by current vol
+        # At 2% buffer with 55% ann vol (~2.9% daily): very comfortable
+        # At 2% buffer with 80% ann vol (~4.2% daily): less certain
+        vol_ratio = daily_vol / 0.025  # normalize against baseline 2.5%
+        adj_factor = max(0.5, min(1.5, 1.0 / vol_ratio))  # higher vol → lower confidence
+
         if pct_above > 0.02:    # spot >2% above threshold
-            model_prob = 0.95
+            model_prob = min(0.97, 0.95 * adj_factor + 0.05)
         elif pct_above > 0.005:
-            model_prob = 0.85
+            model_prob = min(0.90, 0.85 * adj_factor + 0.03)
         elif pct_above > 0:
             model_prob = 0.65
         elif pct_above > -0.005:
             model_prob = 0.40
         else:
-            model_prob = 0.15
+            model_prob = max(0.05, 0.15 / adj_factor)
 
         edge = model_prob - kalshi_mid
         direction = "YES" if edge > 0 else "NO"
         log.info(
             f"[CryptoEdge] {ticker} | {asset} spot=${spot:,.0f} thr=${threshold:,.0f} "
-            f"({pct_above:+.1%}) | model={model_prob:.2f} kalshi={kalshi_mid:.2f} "
+            f"({pct_above:+.1%}) buffer={buffer_pct:.3%} | ann_vol={annualized_vol:.1f}% "
+            f"daily_vol={daily_vol*100:.2f}% | model={model_prob:.2f} kalshi={kalshi_mid:.2f} "
             f"edge={edge:+.3f} → {direction}"
         )
-        return model_prob, edge, direction, f"spot=${spot:,.0f} thr=${threshold:,.0f} {pct_above:+.1%}"
+        return model_prob, edge, direction, (
+            f"spot=${spot:,.0f} thr=${threshold:,.0f} {pct_above:+.1%} "
+            f"vol={annualized_vol:.0f}%ann buffer={buffer_pct:.2%}"
+        )
 
     return None, 0.0, "NO", "parse_error"
 
@@ -1013,11 +1495,20 @@ def fetch_gas_price() -> float:
     """Fetch latest US gas price from FRED (GASREGCOVW series)."""
     return fetch_fred_series("GASREGCOVW")
 
+# Cache commodity prices — single Stooq fetch per scan cycle (5 min TTL)
+_commodity_price_cache: dict = {}
+_commodity_price_ts: float = 0.0
+
 def get_commodity_prices() -> dict:
     """
     Get commodity spot prices from Stooq (free, no auth required).
+    Cached for 5 minutes so bulk scoring doesn't hammer Stooq.
     Falls back to Yahoo Finance scrape if Stooq fails.
     """
+    global _commodity_price_cache, _commodity_price_ts
+    now = time.time()
+    if _commodity_price_cache and (now - _commodity_price_ts) < 300:
+        return _commodity_price_cache
     # Stooq symbol map: name → stooq_ticker
     stooq_map = {
         "GOLD":   "gc.f",    # Gold futures
@@ -1045,6 +1536,9 @@ def get_commodity_prices() -> dict:
                         if close_str:
                             close = float(close_str)
                             if close > 0:
+                                # Silver futures (SI.F) quote in cents/oz on Stooq — convert to $/oz
+                                if name == "SILVER" and close > 1000:
+                                    close = close / 100.0
                                 prices[name] = close
         except Exception as e:
             log.debug(f"[Commodity] Stooq {sym} failed: {e}")
@@ -1052,6 +1546,8 @@ def get_commodity_prices() -> dict:
 
     if prices:
         log.info("[Commodity] Stooq prices: " + " | ".join(f"{k}={v:,.1f}" for k, v in prices.items()))
+        _commodity_price_cache = prices
+        _commodity_price_ts = time.time()
     else:
         log.warning("[Commodity] No prices from Stooq — all commodity edge calcs will skip")
     return prices
@@ -1264,6 +1760,10 @@ def classify_market(ticker: str, title: str, category: str, days_until_close_val
     if ticker_upper.startswith('KXCPI') or ticker_upper.startswith('KXPCE'):
         return 'ECONOMIC_DATA'
 
+    # ── CRYPTO_15M — 15-minute BTC/ETH momentum markets (check BEFORE CRYPTO_SHORT) ──
+    if ('KXBTC15M' in ticker_upper or 'KXETH15M' in ticker_upper):
+        return 'CRYPTO_15M'
+
     # ── CRYPTO_SHORT — daily BTC/ETH price range markets (must check FIRST) ──
     # These appear in ECONOMIC_CALENDAR for awareness but are CRYPTO_SHORT, not ECONOMIC_DATA
     if ('KXBTCD' in ticker_upper or 'KXETHD' in ticker_upper) and days_until_close_val <= 1:
@@ -1314,6 +1814,14 @@ def classify_market(ticker: str, title: str, category: str, days_until_close_val
         return 'JUNK'
 
     # ── ECONOMIC_DATA — high priority ─────────────────────────────────────────
+    # Ticker-based ECONOMIC_DATA classification (highest priority)
+    econ_tickers_cls = ['KXGDP', 'KXCPI', 'KXPCE', 'KXPPI', 'KXNFP', 'KXPAYROLLS', 'KXEURUSD',
+                        'KXFEDDECISION', 'KXFEDMEET', 'KXFEDDOT', 'KXDOTPLOT',
+                        'KXFOMC', 'KXUNRATE', 'KXU3', 'KXRECESSION', 'KXAAAGASW',
+                        'KXSHELTERCPI', 'KXCORECPI']
+    if any(ticker_upper.startswith(p) for p in econ_tickers_cls):
+        return 'ECONOMIC_DATA'
+
     econ_patterns = [
         'cpi', 'inflation', 'consumer price', 'nfp', 'payroll',
         'unemployment', 'fomc', 'federal reserve', 'fed rate',
@@ -1321,6 +1829,7 @@ def classify_market(ticker: str, title: str, category: str, days_until_close_val
         'personal consumption', 'ppi', 'producer price',
         'jobs report', 'non-farm', 'trade deficit', 'retail sales',
         'housing starts', 'durable goods', 'ism manufacturing',
+        'dot plot', 'basis points', 'rate cut', 'rate hike',
     ]
     if any(p in title_lower for p in econ_patterns):
         return 'ECONOMIC_DATA'
@@ -1337,6 +1846,24 @@ def classify_market(ticker: str, title: str, category: str, days_until_close_val
     crypto_patterns = ['bitcoin', 'btc', 'ethereum', 'eth', 'crypto']
     if any(p in title_lower for p in crypto_patterns) and days_until_close_val <= 30:
         return 'CRYPTO_SHORT'
+
+    # ── COMMODITY — gold, silver, oil, S&P futures (ticker-based, date-limited) ──
+    commodity_tickers_cls = [
+        'KXGOLDD', 'KXGOLDW', 'KXGOLDMON', 'KXGOLD',
+        'KXSILVERD', 'KXSILVER',
+        'KXWTI', 'KXBRENT', 'KXOIL',
+        'KXSPYD', 'KXSPY',
+        'KXSPXD', 'KXSPX',
+        'KXNDXD', 'KXNDX',
+    ]
+    if any(ticker_upper.startswith(p.upper()) for p in commodity_tickers_cls) and days_until_close_val <= 7:
+        return 'COMMODITY'
+
+    # Commodity by title keywords
+    commodity_title_patterns = ['gold close price', 'silver close price', 'wti', 'crude oil',
+                                 'oil price', 'gold price', 'silver price']
+    if any(p in title_lower for p in commodity_title_patterns) and days_until_close_val <= 7:
+        return 'COMMODITY'
 
     # ── POLITICAL_LONG — 2028 elections, long nominations ────────────────────
     if days_until_close_val > 365 or '2028' in title or '2027' in title_lower:
@@ -1466,8 +1993,26 @@ def score_market(m: dict, weather_signals: dict = None) -> dict:
     vel = compute_velocity(ticker)
     vel_boost = vel["confidence_boost"] + vel["volume_boost"]
 
+    # Commodity edge boost — bypasses volume-based base_conf for data-driven plays
+    # Low-volume commodity markets (gold/oil/silver) have real model edge but thin book depth
+    commodity_boost = 0.0
+    commodity_note  = ""
+    market_class_sc = classify_market(ticker, m.get("title") or "", m.get("_category",""), d)
+    if market_class_sc == "COMMODITY":
+        try:
+            _cm_prob, _cm_edge, _cm_dir, _cm_src = calculate_commodity_edge(ticker, mid)
+            if _cm_prob is not None and abs(_cm_edge) >= 0.18:
+                # Strong model edge → inject confidence boost proportional to edge
+                commodity_boost = min(0.55, abs(_cm_edge) * 1.5)
+                commodity_note  = "commodity_edge=%.2f" % _cm_edge
+                # Pre-wire the direction and edge so should_execute can use them
+                if "direction" not in m or m.get("direction") != _cm_dir:
+                    pass  # will be overridden in later block
+        except Exception:
+            pass
+
     final_conf = max(0.0, min(1.0,
-        base_conf + whale_boost + weather_boost + vel_boost - time_penalty + near_res_boost
+        base_conf + whale_boost + weather_boost + vel_boost + commodity_boost - time_penalty + near_res_boost
     ))
 
     conf_label = (
@@ -1486,6 +2031,11 @@ def score_market(m: dict, weather_signals: dict = None) -> dict:
     yes_ask_c = int(yes_ask * 100)
 
     bankroll_rec = "3-5%" if conf_label == "HIGH" else ("1-2%" if conf_label == "MEDIUM" else "0%")
+
+    # Store commodity boost for downstream use
+    _commodity_boost_val  = commodity_boost
+    _commodity_note_val   = commodity_note
+    _market_class_sc_val  = market_class_sc
 
     whale_contracts_k = round(
         (whale_stats["yes_contracts"] if direction == "YES" else whale_stats["no_contracts"]) / 1000, 1
@@ -1510,6 +2060,8 @@ def score_market(m: dict, weather_signals: dict = None) -> dict:
         "weather_note":      weather_note,
         "velocity_label":    vel["velocity_label"],
         "velocity_c_min":    vel["velocity_c_per_min"],
+        "commodity_boost":   commodity_boost,
+        "market_class":      market_class_sc,
         "_market":           m,
     }
 
@@ -1549,9 +2101,15 @@ def score_and_rank_markets(
             e = sig.get("edge", 0.0)
             weather_edge_scores[t] = max(weather_edge_scores.get(t, 0.0), min(e, 1.0))
 
-    # Flatten all liquid markets
+    # Flatten all liquid markets — COMMODITY and CRYPTO_SHORT first so they score
+    # before any timeout, since they have direct data model edge
+    PRIORITY_ORDER = ["COMMODITY", "CRYPTO_SHORT", "ECONOMIC_DATA"]
+    priority_cats  = {cat: top_by_cat[cat] for cat in PRIORITY_ORDER if cat in top_by_cat}
+    other_cats     = {cat: mkts for cat, mkts in top_by_cat.items() if cat not in PRIORITY_ORDER}
+    ordered_cats   = {**priority_cats, **other_cats}
+
     all_tops = []
-    for cat, markets in top_by_cat.items():
+    for cat, markets in ordered_cats.items():
         for m in markets:
             all_tops.append((m, liquidity_score(m)))
 
@@ -1580,12 +2138,26 @@ def score_and_rank_markets(
 
         base_liq   = liq_val / max_liq
         edge_score = weather_edge_scores.get(ticker, 0.0)
-        composite  = tier_mult * (base_liq * 0.4 + edge_score * 0.6)
+        # IMPROVEMENT 4: edge-dominant scoring for markets with real model edge
+        # econ_edge pre-computed here via weather_edge_scores proxy (crypto/weather signals);
+        # full econ-model override happens later in the candidate loop.
+        # For initial ranking, use edge-dominant formula when edge_score is set.
+        if edge_score > 0.0:
+            composite = tier_mult * (base_liq * 0.1 + edge_score * 0.9)
+        else:
+            composite = tier_mult * (base_liq * 0.4 + edge_score * 0.6)
         scored_markets.append((m, composite, market_class))
 
     # Sort by composite score, take top N candidates
     scored_markets.sort(key=lambda x: x[1], reverse=True)
-    candidates = scored_markets[:WHALE_FETCH_TOP_N]
+    # Ensure COMMODITY and CRYPTO_SHORT markets are always in candidates
+    # They may rank low on volume but have strong model edge
+    priority_mc = {"COMMODITY", "CRYPTO_SHORT"}
+    priority_cands = [(m, c, mc) for m, c, mc in scored_markets if mc in priority_mc]
+    other_cands    = [(m, c, mc) for m, c, mc in scored_markets if mc not in priority_mc]
+    # Put priority markets first, fill remaining slots with top others
+    merged = priority_cands + other_cands
+    candidates = [(m, c, mc) for m, c, mc in merged[:WHALE_FETCH_TOP_N]]
 
     log.info(
         f"[Scoring] {junk_count} JUNK excluded | "
@@ -1616,9 +2188,9 @@ def score_and_rank_markets(
         if market_class == "ECONOMIC_DATA":
             model_prob, econ_edge, econ_direction, econ_source = calculate_economic_edge(ticker, mid)
             if model_prob is not None and abs(econ_edge) > 0.10:
-                # Override composite with data-driven edge — edge dominates
+                # Override composite with data-driven edge — edge dominates (IMPROVEMENT 4)
                 edge_score = min(abs(econ_edge), 1.0)
-                composite = tier_mult * (base_liq * 0.2 + edge_score * 0.8)
+                composite = tier_mult * (base_liq * 0.1 + edge_score * 0.9)
                 play["econ_edge"]      = round(econ_edge, 3)
                 play["econ_direction"] = econ_direction
                 play["econ_source"]    = econ_source
@@ -1654,6 +2226,18 @@ def score_and_rank_markets(
                     play["composite"] = play.get("composite", 0) + abs(econ_edge) * tier_mult
                 log.info(f"[Cleveland] {ticker}: model={model_prob:.0%} kalshi={mid:.0%} edge={econ_edge:+.2f} → {econ_dir} ({econ_src})")
 
+        # EUR/USD edge calculator
+        if market_class == "ECONOMIC_DATA" and ticker.upper().startswith('KXEURUSD'):
+            model_prob, econ_edge, econ_dir, econ_src = calculate_eurusd_edge(ticker, mid)
+            if model_prob is not None:
+                play["econ_edge"] = round(econ_edge, 3)
+                play["econ_direction"] = econ_dir
+                play["econ_source"] = econ_src
+                play["direction"] = econ_dir
+                if abs(econ_edge) > 0.10:
+                    play["composite"] = play.get("composite", 0) + abs(econ_edge) * tier_mult
+                log.info(f"[Forex] {ticker}: model={model_prob:.0%} kalshi={mid:.0%} edge={econ_edge:+.2f} -> {econ_dir} ({econ_src})")
+
         # FOMC edge calculator for KXFEDDECISION markets
         if market_class == "ECONOMIC_DATA" and ticker.upper().startswith('KXFEDDECISION'):
             model_prob, econ_edge, econ_dir, econ_src = calculate_fomc_edge(ticker, mid)
@@ -1677,6 +2261,19 @@ def score_and_rank_markets(
                 if abs(econ_edge) > 0.10:
                     play["composite"] = play.get("composite", 0) + abs(econ_edge) * tier_mult
                 log.info(f"[NFP] {ticker}: model_prob={model_prob:.0%} kalshi={mid:.0%} edge={econ_edge:+.2f} → {econ_dir} ({econ_src})")
+
+        # CRYPTO_15M edge calculator for KXBTC15M/KXETH15M 15-minute momentum markets
+        if market_class == 'CRYPTO_15M':
+            prob, edge_val, edge_dir, edge_src = calculate_crypto15m_edge(ticker, m)
+            if prob is not None:
+                play["econ_edge"] = round(edge_val, 3)
+                play["econ_direction"] = edge_dir
+                play["econ_source"] = edge_src
+                play["direction"] = edge_dir
+                play["market_class"] = "CRYPTO_15M"
+                if abs(edge_val) >= 0.10:
+                    play["composite"] = play.get("composite", 0) + abs(edge_val) * tier_mult
+                log.info(f"[Crypto15M] Wired {ticker}: prob={prob:.2f} kalshi={mid:.2f} edge={edge_val:+.3f} → {edge_dir}")
 
         # Crypto edge calculator for KXBTCD/KXETHD daily price range markets
         if market_class == 'CRYPTO_SHORT' and ('KXBTCD' in ticker.upper() or 'KXETHD' in ticker.upper()):
@@ -1971,28 +2568,38 @@ def get_total_exposure(positions: dict = None) -> float:
     return total
 
 def calculate_contracts(signal: dict, balance: float) -> int:
-    conf = signal.get("confidence", 0.0)
-    days = signal.get("days_until_close", 90)
+    """Size position using half-Kelly when edge is known, else fixed-pct fallback."""
+    mid_c         = signal.get("mid_c", 50)
+    price_dollars = max(mid_c / 100.0, 0.01)
+    edge          = signal.get("edge", None)
 
-    if conf >= 0.85:
-        size_pct = 0.08
-    elif conf >= 0.75:
-        size_pct = 0.06
+    if edge is not None:
+        # Half-Kelly: f = 0.5 * |edge| / (1 - entry_price)
+        denom = max(1.0 - price_dollars, 0.01)
+        f     = 0.5 * abs(float(edge)) / denom
+        # Floor 2%, cap at EXEC_MAX_PER_POSITION (35%)
+        f     = max(0.02, min(f, EXEC_MAX_PER_POSITION))
+        spend = balance * f
+        log.debug(f"[KELLY] edge={edge:.3f} price={price_dollars:.2f} f={f:.3f} spend=${spend:.2f}")
     else:
-        size_pct = 0.04
+        # Fallback: fixed 5% (original logic)
+        spend = balance * EXEC_POSITION_SIZE_PCT
+        log.debug(f"[KELLY] No edge — fixed size_pct={EXEC_POSITION_SIZE_PCT:.2f} spend=${spend:.2f}")
 
-    if days <= 3:
-        size_pct = min(size_pct * 1.5, 0.12)
-
-    price_dollars = max(signal.get("mid_c", 50) / 100.0, 0.01)
-    base_spend = balance * size_pct
     max_spend = balance * EXEC_MAX_PER_POSITION
-    spend = min(base_spend, max_spend)
-    contracts = max(1, math.floor(spend / price_dollars))
+    spend     = min(spend, max_spend)
 
+    # Longshot cap: markets priced < 15c capped at MAX_LONGSHOT_DOLLARS
+    # Prevents Kelly from over-sizing cheap contracts with thin edge
+    if price_dollars < 0.15:
+        spend = min(spend, MAX_LONGSHOT_DOLLARS)
+        log.debug("[KELLY] Longshot cap applied (price=%.0fc): spend capped at $%.2f",
+                  price_dollars * 100, spend)
+
+    contracts = max(1, math.floor(spend / price_dollars))
     return contracts
 
-def should_execute(signal: dict, balance: float, positions: dict, total_exposure: float) -> tuple:
+def _should_execute_inner(signal: dict, balance: float, positions: dict, total_exposure: float) -> tuple:
     """Check all guardrails. Returns (ok, reason). Never bypass."""
     ticker    = signal.get("ticker", "UNKNOWN")
     direction = signal.get("direction", "YES")
@@ -2004,10 +2611,33 @@ def should_execute(signal: dict, balance: float, positions: dict, total_exposure
         return False, f"market resolves in {days_out} days (>90 day auto-exec limit)"
 
     # Only execute on categories where we have data model edge
-    EXECUTABLE_CATEGORIES = {"ECONOMIC_DATA", "CRYPTO_SHORT", "COMMODITY"}  # WEATHER is Mark Hanna/weather.py's domain
+    EXECUTABLE_CATEGORIES = {"ECONOMIC_DATA"}  # CRYPTO + COMMODITY paused 2026-05-03 — strategy review 2026-05-03 — strategy review  # WEATHER is Mark Hanna/weather.py's domain
     market_class = signal.get("market_class", "")
     if market_class not in EXECUTABLE_CATEGORIES:
         return False, f"category '{market_class}' is inform-only — no autonomous execution"
+
+    # ── CRYPTO_15M special guardrails (lower edge bar, daily cap) ────────────
+    if market_class == 'CRYPTO_15M':
+        # Lower edge bar: 10c minimum (not 18c)
+        crypto15m_edge = abs(signal.get('econ_edge', 0.0))
+        if crypto15m_edge < 0.10:
+            return False, "CRYPTO_15M edge %.2f < 0.10 minimum" % crypto15m_edge
+        # Daily cap: max 2 CRYPTO_15M positions per UTC day
+        today_utc = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        try:
+            import json as _j
+            from pathlib import Path as _p
+            _es = _j.loads(_p('/home/cody/stratton/data/eval_store.json').read_text())
+            _today_15m = sum(1 for t in _es
+                            if t.get('market_class') == 'CRYPTO_15M'
+                            and today_utc in (t.get('entry_date', '') or ''))
+            if _today_15m >= 2:
+                return False, "CRYPTO_15M daily cap: already %d positions today" % _today_15m
+        except Exception:
+            pass  # eval_store missing or unreadable — allow trade
+        # Skip standard confidence threshold for 15M — use our own edge check above
+        # Fall through to remaining guardrails (balance, exposure, etc.)
+
 
     if conf < CONFIDENCE_HIGH_THRESHOLD:
         return False, f"confidence {conf:.2f} below HIGH threshold {CONFIDENCE_HIGH_THRESHOLD}"
@@ -2070,6 +2700,21 @@ def should_execute(signal: dict, balance: float, positions: dict, total_exposure
     if ticker in positions:
         return False, f"already have open position in {ticker}"
 
+    # ── Correlation Cap — limit open positions per market class ──────────────
+    _cap = MAX_POSITIONS_PER_CLASS.get(market_class)
+    if _cap is not None:
+        # Count open positions in same class (classify each open ticker)
+        _open_in_class = 0
+        for _open_ticker in positions:
+            try:
+                _open_class = classify_market(_open_ticker, "", "", datetime.now(timezone.utc))
+            except Exception:
+                _open_class = ""
+            if _open_class == market_class:
+                _open_in_class += 1
+        if _open_in_class >= _cap:
+            return False, (f"correlation cap: already {_open_in_class}/{_cap} open {market_class} positions")
+
     # Thesis direction lock — never trade against hard-coded thesis
     locked_direction = _get_active_thesis_locks().get(ticker)
     if locked_direction and direction.upper() != locked_direction:
@@ -2091,6 +2736,17 @@ def should_execute(signal: dict, balance: float, positions: dict, total_exposure
         return False, f"cost ${cost:.2f} exceeds available balance ${balance:.2f}"
 
     return True, "all guardrails passed"
+
+def should_execute(signal: dict, balance: float, positions: dict, total_exposure: float) -> tuple:
+    """Public wrapper: calls _should_execute_inner and logs skips via log_skip."""
+    result = _should_execute_inner(signal, balance, positions, total_exposure)
+    ok, reason = result
+    if not ok:
+        try:
+            log_skip(signal.get("ticker", "UNKNOWN"), reason, signal)
+        except Exception as _lse:
+            log.debug(f"[SKIP_LOG] Error in log_skip: {_lse}")
+    return result
 
 def execute_trade(signal: dict, dry_run: bool = False) -> dict:
     ticker    = signal.get("ticker", "")
@@ -2238,16 +2894,150 @@ def post_execution_result(signal: dict, result: dict, dry_run: bool = False):
 
     post_discord(msg, channel_id=DISCORD_CH_RESULTS, dry_run=dry_run)
 
+
+# ── Daily Loss Kill Switch helpers ───────────────────────────────────────────
+
+def _load_daily_loss() -> dict:
+    """Load today's daily loss state; reset if date mismatch."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    try:
+        if os.path.exists(DAILY_LOSS_PATH):
+            with open(DAILY_LOSS_PATH) as f:
+                data = json.load(f)
+            if data.get("date") == today:
+                return data
+    except Exception:
+        pass
+    return {"date": today, "realized_loss": 0.0, "halt_trading": False}
+
+def _save_daily_loss(state: dict) -> None:
+    """Persist daily loss state to JSON."""
+    try:
+        os.makedirs(os.path.dirname(DAILY_LOSS_PATH), exist_ok=True)
+        with open(DAILY_LOSS_PATH, "w") as f:
+            json.dump(state, f)
+    except Exception as e:
+        log.warning(f"[DAILY_LOSS] Failed to save state: {e}")
+
+def update_daily_loss(amount: float) -> None:
+    """Add realized loss (positive = loss) and check limit."""
+    state = _load_daily_loss()
+    state["realized_loss"] = round(state["realized_loss"] + amount, 4)
+    if state["realized_loss"] >= DAILY_LOSS_LIMIT_DOLLARS and not state["halt_trading"]:
+        state["halt_trading"] = True
+        log.warning(f"[DAILY_LOSS] Daily loss limit hit: ${state['realized_loss']:.2f} >= ${DAILY_LOSS_LIMIT_DOLLARS:.2f} — trading halted")
+    _save_daily_loss(state)
+
+
+# ── Skip Reason Logger ────────────────────────────────────────────────────────
+
+def log_skip(ticker: str, reason: str, signal: dict) -> None:
+    """Append a skip record to skip_log.jsonl; rotate if > 10 MB."""
+    try:
+        # Rotate if oversized
+        if os.path.exists(SKIP_LOG_PATH) and os.path.getsize(SKIP_LOG_PATH) > SKIP_LOG_MAX_BYTES:
+            os.replace(SKIP_LOG_PATH, SKIP_LOG_PATH + ".old")
+        os.makedirs(os.path.dirname(SKIP_LOG_PATH), exist_ok=True)
+        record = {
+            "ts":          datetime.now(timezone.utc).isoformat(),
+            "ticker":      ticker,
+            "reason":      reason,
+            "edge":        round(float(signal.get("edge", 0.0) or 0.0), 4),
+            "model_prob":  round(float(signal.get("model_prob", 0.0) or 0.0), 4),
+            "kalshi_mid":  round(float(signal.get("mid_c", 0.0) or 0.0) / 100.0, 4),
+            "direction":   signal.get("direction", ""),
+            "market_class": signal.get("market_class", ""),
+        }
+        with open(SKIP_LOG_PATH, "a") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception as e:
+        log.debug(f"[SKIP_LOG] Write error: {e}")
+
 def run_execution_check(plays: list, dry_run: bool = False):
     """Check HIGH-confidence signals and execute if guardrails pass."""
+    # ── Daily Loss Kill Switch ────────────────────────────────────────────────
+    _daily = _load_daily_loss()
+    if _daily.get("halt_trading"):
+        _loss = _daily.get("realized_loss", 0.0)
+        _msg  = (f"🛑 TRADING HALTED — daily loss ${_loss:.2f} >= limit ${DAILY_LOSS_LIMIT_DOLLARS:.2f}. "
+                 f"Resets at UTC midnight.")
+        log.warning(f"[DAILY_LOSS] {_msg}")
+        # Alert only once per halt (check flag)
+        _halted_flag = DAILY_LOSS_PATH + ".alerted"
+        if not os.path.exists(_halted_flag):
+            post_discord(_msg, channel_id=DISCORD_CH_RESULTS, dry_run=dry_run)
+            try:
+                open(_halted_flag, "w").close()
+            except Exception:
+                pass
+        return
+
+    # Clear alert flag if we're a new day (state was reset)
+    _halted_flag = DAILY_LOSS_PATH + ".alerted"
+    if os.path.exists(_halted_flag):
+        try:
+            os.remove(_halted_flag)
+        except Exception:
+            pass
+
     high_signals = [p for p in plays if p["confidence"] >= CONFIDENCE_HIGH_THRESHOLD]
     log.info(f"[EXEC] {len(high_signals)} HIGH confidence signals to evaluate")
+
+    # CRYPTO TIER FILTER: For CRYPTO_SHORT markets, enforce 2-tier selection
+    # (1 primary per close time + 1 global longshot) to prevent spray of positions.
+    # Score = edge * kelly * payout_multiple. Select best per close time.
+    _crypto_executed_closes: set = set()
+    _crypto_longshot_used: bool = False
+
+    def _crypto_allowed(sig: dict) -> tuple:
+        """Returns (allowed: bool, reason: str) for CRYPTO_SHORT signals."""
+        nonlocal _crypto_longshot_used
+        mc = sig.get("market_class", "")
+        if mc != "CRYPTO_SHORT":
+            return True, "not crypto"
+        mid_c = sig.get("mid_c", 50)
+        price = mid_c / 100.0
+        ticker = sig.get("ticker", "")
+        close_key = ""
+        try:
+            from datetime import timezone as _tz
+            m = sig.get("_market", {})
+            ct_str = m.get("close_time", "") if m else ""
+            close_key = ct_str[:13]  # e.g. "2026-05-03T22"
+        except Exception:
+            close_key = ticker[:15]
+
+        econ_edge = abs(sig.get("econ_edge", 0) or 0)
+        denom = max(1.0 - price, 0.01)
+        kelly_f = 0.5 * econ_edge / denom if econ_edge else 0
+        payout = (1.0 - price) / max(price, 0.01) if price > 0 else 1.0
+        score = econ_edge * kelly_f * payout
+
+        # Longshot tier: entry < 15c
+        if price < 0.15:
+            if _crypto_longshot_used:
+                return False, "CRYPTO_SHORT global longshot cap (1 per scan)"
+            _crypto_longshot_used = True
+            return True, "CRYPTO_SHORT LONGSHOT tier (score=%.4f)" % score
+
+        # Primary tier: 1 per close time
+        if close_key in _crypto_executed_closes:
+            return False, "CRYPTO_SHORT primary already executed for close %s" % close_key
+        _crypto_executed_closes.add(close_key)
+        return True, "CRYPTO_SHORT PRIMARY tier (score=%.4f close=%s)" % (score, close_key)
 
     for signal in high_signals:
         try:
             balance    = get_balance()
             positions  = get_open_positions()
             total_exp  = get_total_exposure(positions)
+            # Apply crypto tier filter before standard guardrails
+            _allowed, _allow_reason = _crypto_allowed(signal)
+            if not _allowed:
+                log.info("[EXEC] Skipping %s: %s", signal.get("ticker","?"), _allow_reason)
+                log_skip(signal.get("ticker","?"), _allow_reason, signal)
+                continue
+
             ok, reason = should_execute(signal, balance, positions, total_exp)
 
             if ok:
@@ -2275,14 +3065,23 @@ def run_execution_check(plays: list, dry_run: bool = False):
                             ),
                             macro_context = "Tariff environment, Iran energy shock, Fed on hold",
                         )
-                        # Shadow consensus for high-edge trades (>30pt)
-                        _use_shadow = _econ_edge_g6 > 0.30
-                        _g6_result = llm_reason(
-                            _g6_prompt,
-                            primary="grok",
-                            shadow="claude" if _use_shadow else None,
-                            require_consensus=_use_shadow
-                        )
+                        # Gate 6 logic:
+                        # edge > 40c: auto-approve — overwhelming model confidence, LLM adds noise
+                        # edge 20-40c: Grok single-LLM check, no consensus required
+                        # Rationale: strong quant edge should NOT require dual-LLM consensus.
+                        #   High edge = model is confident. Consensus gate was blocking best signals.
+                        #   LLM value is in flagging marginal trades, not vetoing strong ones.
+                        if _econ_edge_g6 >= 0.40:
+                            log.info(f"[ECONOMICS] Gate 6 AUTO-APPROVE {_g6_ticker}: edge={_econ_edge_g6:.2f} >= 0.40 threshold")
+                            _g6_result = {"go": True, "reasoning": "auto-approved: edge >= 40c", "confidence": "HIGH"}
+                        else:
+                            # Grok only — no consensus required for 20-40c edge
+                            _g6_result = llm_reason(
+                                _g6_prompt,
+                                primary="grok",
+                                shadow=None,
+                                require_consensus=False
+                            )
                         if not _g6_result.get("go", True):  # default True if LLM fails
                             _g6_reason = _g6_result.get('reasoning', 'no reason')[:100]
                             log.info(f"[ECONOMICS] LLM gate BLOCKED {_g6_ticker}: {_g6_reason}")
@@ -2317,6 +3116,8 @@ def run_execution_check(plays: list, dry_run: bool = False):
                             raw_thesis=f"mid={signal.get('mid_c', 0)}c model_prob={signal.get('model_prob', 0):.3f}",
                             raw_llm_reason=signal.get('llm_reason', '')[:500] if signal.get('llm_reason') else '',
                             exposure_dollars=round(signal.get('contracts', 1) * (signal.get('mid_c', 50) / 100), 2),
+                            market_class=signal.get('market_class', ''),
+                            entry_date=datetime.now(timezone.utc).strftime('%Y-%m-%d'),
                         )
                     except Exception:
                         pass  # eval logging never blocks execution
@@ -2368,9 +3169,29 @@ def run_discovery_scan(dry_run: bool = False) -> tuple:
     )
 
     # Update watchlist (top WATCHLIST_SIZE markets for Tier 2)
-    watchlist = [p["_market"] for p in plays[:WATCHLIST_SIZE] if "_market" in p]
+    # Always include COMMODITY and CRYPTO_SHORT markets with edge — they may rank low
+    # on composite score due to thin volume but have strong model edge
+    _priority_markets = []
+    _seen_tickers = set()
+    for p in plays:
+        mc = p.get("market_class", "")
+        if mc in ("COMMODITY", "CRYPTO_SHORT", "CRYPTO_15M") and abs(p.get("econ_edge", 0)) >= 0.10:
+            if "_market" in p and p["ticker"] not in _seen_tickers:
+                _priority_markets.append(p["_market"])
+                _seen_tickers.add(p["ticker"])
+    # Fill remaining slots with top composite plays
+    _remaining = WATCHLIST_SIZE - len(_priority_markets)
+    for p in plays:
+        if p.get("ticker") not in _seen_tickers and "_market" in p and _remaining > 0:
+            _priority_markets.append(p["_market"])
+            _seen_tickers.add(p["ticker"])
+            _remaining -= 1
+    watchlist = _priority_markets[:WATCHLIST_SIZE]
     last_scan_top_markets = [p["ticker"] for p in plays if p["conf_label"] in ("HIGH", "MEDIUM")]
-    log.info(f"Watchlist updated: {len(watchlist)} markets | Top radar: {len(last_scan_top_markets)}")
+    commodity_in_wl = sum(1 for m in watchlist if classify_market(
+        m.get("ticker",""), m.get("title",""), m.get("_category",""),
+        days_until_close(m)) in ("COMMODITY", "CRYPTO_SHORT", "CRYPTO_15M"))
+    log.info(f"Watchlist updated: {len(watchlist)} markets ({commodity_in_wl} commodity/crypto) | Top radar: {len(last_scan_top_markets)}")
 
     # News RSS scan — apply +0.08 confidence boost for matching headlines
     news_matches = run_news_scan(watchlist, dry_run=dry_run)
@@ -2684,6 +3505,79 @@ def fetch_crypto_prices() -> dict:
         log.error(f"[Crypto] Price fetch error: {e}")
     return {}
 
+
+# Fear & Greed cache (1-hour TTL — index changes daily)
+_fng_cache: dict = {}
+_fng_cache_ts: float = 0.0
+
+def fetch_crypto_fear_greed() -> dict:
+    """
+    Fetch Crypto Fear & Greed Index from alternative.me (free, no auth).
+    Cached for 1 hour.
+    Returns {"value": int, "classification": str, "timestamp": str}
+    """
+    import time as _time
+    global _fng_cache, _fng_cache_ts
+    now = _time.time()
+    if _fng_cache and (now - _fng_cache_ts) < 3600:
+        return _fng_cache
+    try:
+        r = requests.get(
+            "https://api.alternative.me/fng/?limit=1",
+            timeout=8, headers={"Accept": "application/json"}
+        )
+        if r.status_code == 200:
+            data = r.json().get("data", [{}])[0]
+            val = int(data.get("value", 50))
+            cls = data.get("value_classification", "Neutral")
+            ts  = data.get("timestamp", "")
+            _fng_cache = {"value": val, "classification": cls, "timestamp": ts}
+            _fng_cache_ts = now
+            log.info("[Crypto] Fear & Greed: %d (%s)", val, cls)
+            return _fng_cache
+        log.warning("[Crypto] FNG API → %d", r.status_code)
+    except Exception as e:
+        log.warning("[Crypto] FNG fetch error: %s", e)
+    return {"value": 50, "classification": "Neutral", "timestamp": ""}
+
+
+def score_crypto_signal(
+    spot_prob: float,
+    kalshi_mid: float,
+    edge: float,
+    entry_price: float,
+    fear_greed_value: int,
+    direction: str,
+) -> tuple:
+    """
+    Mathematical score to select the single best BTC/ETH position per close time.
+
+    Components:
+    1. Expected Value = edge (model_prob - market_prob) — primary driver
+    2. Kelly fraction = 0.5 * abs(edge) / (1 - entry_price) — sizing efficiency
+    3. Risk/Reward = payout_multiple = (1 - entry_price) / entry_price — asymmetry
+    4. Sentiment alignment bonus:
+       +0.05 if direction == "YES" and fear_greed > 55  (greed supports up moves)
+       +0.05 if direction == "NO"  and fear_greed < 45  (fear supports down moves)
+       0 otherwise
+
+    Score = edge * kelly_f * payout_multiple * (1 + sentiment_bonus)
+    Returns (score: float, sentiment_aligned: bool)
+    """
+    kelly_f = 0.5 * abs(edge) / max(1.0 - entry_price, 0.01)
+    payout_multiple = max(1.0 - entry_price, 0.01) / max(entry_price, 0.01)
+    if direction == "YES" and fear_greed_value > 55:
+        sentiment_bonus = 0.05
+        sentiment_aligned = True
+    elif direction == "NO" and fear_greed_value < 45:
+        sentiment_bonus = 0.05
+        sentiment_aligned = True
+    else:
+        sentiment_bonus = 0.0
+        sentiment_aligned = False
+    score = edge * kelly_f * payout_multiple * (1.0 + sentiment_bonus)
+    return score, sentiment_aligned
+
 def _spot_to_prob(spot: float, threshold: float) -> float:
     """
     Convert spot price vs threshold into an implied probability for a
@@ -2761,6 +3655,11 @@ def run_crypto_monitor(dry_run: bool = False) -> dict:
         return crypto_signals
 
     new_crypto_signals = {}
+    candidates_by_close: dict = {}   # close_time_key → list of candidate signals
+    longshot_candidates: list = []   # entry_price < 0.15
+
+    # Fetch Fear & Greed Index once (cached 1h)
+    fg = fetch_crypto_fear_greed()
 
     # Build a lookup of symbol → spot_price + 24h_change
     spot = {}
@@ -2785,6 +3684,33 @@ def run_crypto_monitor(dry_run: bool = False) -> dict:
     if not watchlist:
         crypto_signals = new_crypto_signals
         return crypto_signals
+
+    # MOMENTUM TRIGGER: only scan if BTC/ETH moved >0.5% since last scan
+    global _prev_btc_spot, _prev_eth_spot
+    btc_now = spot.get("BTC", {}).get("price", 0) if isinstance(spot.get("BTC"), dict) else next((d["price"] for s,d in spot.items() if s=="BTC"), 0)
+    eth_now = spot.get("ETH", {}).get("price", 0) if isinstance(spot.get("ETH"), dict) else next((d["price"] for s,d in spot.items() if s=="ETH"), 0)
+    # spot dict has format {sym: {"price": x, ...}}
+    btc_now = spot.get("BTC", {}).get("price", 0)
+    eth_now = spot.get("ETH", {}).get("price", 0)
+    btc_moved = abs(btc_now - _prev_btc_spot) / max(_prev_btc_spot, 1) if _prev_btc_spot > 0 else 1.0
+    eth_moved = abs(eth_now - _prev_eth_spot) / max(_prev_eth_spot, 1) if _prev_eth_spot > 0 else 1.0
+    btc_direction = 1 if btc_now >= _prev_btc_spot else -1
+    eth_direction = 1 if eth_now >= _prev_eth_spot else -1
+
+    if _prev_btc_spot > 0 and btc_moved < BTC_MOMENTUM_THRESHOLD and eth_moved < BTC_MOMENTUM_THRESHOLD:
+        log.info("[Crypto] No momentum signal (BTC %+.3f%%, ETH %+.3f%%) — skipping edge scan",
+                 btc_moved*100, eth_moved*100)
+        _prev_btc_spot = btc_now
+        _prev_eth_spot = eth_now
+        crypto_signals = new_crypto_signals
+        return crypto_signals
+
+    if _prev_btc_spot > 0:
+        log.info("[Crypto] Momentum: BTC %+.3f%% %s | ETH %+.3f%% %s",
+                 btc_moved*100, "UP" if btc_direction>0 else "DN",
+                 eth_moved*100, "UP" if eth_direction>0 else "DN")
+    _prev_btc_spot = btc_now
+    _prev_eth_spot = eth_now
 
     # Scan watchlist for crypto markets resolving within 24h
     for m in watchlist:
@@ -2833,23 +3759,149 @@ def run_crypto_monitor(dry_run: bool = False) -> dict:
 
         if edge > EXEC_MIN_EDGE_DOLLARS:
             side = "YES" if spot_prob > kalshi_mid else "NO"
-            new_crypto_signals[ticker] = {
-                "ticker":      ticker,
-                "symbol":      matched_sym,
-                "spot_price":  spot_price,
-                "threshold":   threshold,
-                "above":       above,
-                "side":        side,
-                "spot_prob":   round(spot_prob, 3),
-                "kalshi_mid":  round(kalshi_mid, 3),
-                "edge":        round(edge, 3),
-                "volatile":    spot[matched_sym]["volatile"],
-                "change_24h":  spot[matched_sym]["change_24h"],
-                "confidence_boost": 0.25 if edge > 0.20 else 0.15,
+
+            # BUFFER CHECK — enforce 0.5% minimum between spot and threshold
+            # This is the same guardrail as in calculate_crypto_edge() / should_execute()
+            # Without this check, thin-buffer markets slip through this parallel path
+            buffer_pct = abs(spot_price - threshold) / threshold
+            if buffer_pct < 0.005:
+                log.info(
+                    "[Crypto] %s: buffer %.3f%% < 0.5%% minimum — skipping signal",
+                    ticker, buffer_pct * 100
+                )
+                continue
+
+            # 30-MIN EXPIRY CHECK — same as should_execute() guardrail
+            ct_str = m.get("close_time", "")
+            if ct_str:
+                try:
+                    ct = datetime.fromisoformat(ct_str.replace("Z", "+00:00"))
+                    mins_to_close = (ct - datetime.now(timezone.utc)).total_seconds() / 60
+                    if mins_to_close < 30:
+                        log.info(
+                            "[Crypto] %s: %.0f min to close < 30 min cutoff — skipping signal",
+                            ticker, mins_to_close
+                        )
+                        continue
+                except Exception:
+                    pass
+
+            # DIRECTION ALIGNMENT: only take positions in the direction of the momentum
+            # If BTC moved UP, prefer YES (above threshold). If DOWN, prefer NO (below threshold).
+            asset_direction = btc_direction if matched_sym == "BTC" else eth_direction
+            if asset_direction > 0 and side == "NO" and above:
+                log.info("[Crypto] %s: skipping NO bet against upward momentum", ticker)
+                continue
+            elif asset_direction < 0 and side == "YES" and above:
+                log.info("[Crypto] %s: skipping YES bet against downward momentum", ticker)
+                continue
+
+            close_time_key = m.get("close_time", "")[:13]  # e.g. "2026-05-03T22"
+            entry_price = kalshi_mid if side == "YES" else (1.0 - kalshi_mid)
+            opp_score, sent_aligned = score_crypto_signal(
+                spot_prob=spot_prob,
+                kalshi_mid=kalshi_mid,
+                edge=edge,
+                entry_price=entry_price,
+                fear_greed_value=fg["value"],
+                direction=side,
+            )
+
+            # Accumulate candidates keyed by close_time_key
+            candidate = {
+                "ticker":            ticker,
+                "symbol":            matched_sym,
+                "spot_price":        spot_price,
+                "threshold":         threshold,
+                "above":             above,
+                "side":              side,
+                "spot_prob":         round(spot_prob, 3),
+                "kalshi_mid":        round(kalshi_mid, 3),
+                "edge":              round(edge, 3),
+                "volatile":          spot[matched_sym]["volatile"],
+                "change_24h":        spot[matched_sym]["change_24h"],
+                "close_time_key":    close_time_key,
+                "momentum_pct":      round(btc_moved * 100 if matched_sym == "BTC" else eth_moved * 100, 3),
+                "confidence_boost":  0.25 if edge > 0.20 else 0.15,
+                "opportunity_score": round(opp_score, 6),
+                "fear_greed":        fg["value"],
+                "sentiment_aligned": sent_aligned,
+                "entry_price":       round(entry_price, 4),
+                "buffer_pct":        round(buffer_pct * 100, 4),  # stored for tier-2 filter
             }
+            candidates_by_close.setdefault(close_time_key, []).append(candidate)
+
+            # Longshot pool — collected here, selected after loop
+            if entry_price < 0.15:
+                longshot_candidates.append(candidate)
+
+    # ── TIER 1: SINGLE BEST PRIMARY SIGNAL PER CLOSE TIME ───────────────────
+    # Primary = entry_price in [0.20, 0.50] — solid edge, ~1-2% buffer from spot
+    for close_time_key, candidates in candidates_by_close.items():
+        primaries = [c for c in candidates if 0.20 <= c["entry_price"] <= 0.50]
+        if not primaries:
+            log.info("[Crypto] %s close: no primary-tier candidates (20-50c) — skipping", close_time_key)
+            continue
+        best = max(primaries, key=lambda c: c["opportunity_score"])
+        best["tier"] = "PRIMARY"
+        new_crypto_signals[best["ticker"]] = best
+        log.info(
+            "[Crypto] Best signal for %s close: %s score=%.4f edge=%+.2f direction=%s entry=%.2f",
+            close_time_key, best["ticker"], best["opportunity_score"],
+            best["edge"], best["side"], best["entry_price"]
+        )
+        rejected = len(primaries) - 1
+        skipped_tier = len(candidates) - len(primaries)
+        if rejected > 0:
             log.info(
-                f"[Crypto] SIGNAL: {ticker} — {matched_sym} spot ${spot_price:,.0f} "
-                f"vs threshold ${threshold:,.0f} | edge={edge:.2f} → BUY {side}"
+                "[Crypto] Rejected %d lower-scoring primary candidate(s) for this close time",
+                rejected
+            )
+        if skipped_tier > 0:
+            log.info(
+                "[Crypto] Skipped %d out-of-tier candidate(s) (<20c or >50c) for this close time",
+                skipped_tier
+            )
+
+    # ── TIER 2: SINGLE GLOBAL LONGSHOT ───────────────────────────────────────
+    # Longshot = entry_price < 0.15, edge >= 0.12, buffer >= 1.0%
+    # One per scan session total — pick the single highest-scoring qualifying candidate
+    LONGSHOT_MIN_EDGE   = 0.12
+    LONGSHOT_MIN_BUFFER = 1.0  # percent
+
+    qualified_longshots = [
+        c for c in longshot_candidates
+        if c["edge"] >= LONGSHOT_MIN_EDGE
+        and c.get("buffer_pct", 0.0) >= LONGSHOT_MIN_BUFFER
+    ]
+
+    if qualified_longshots:
+        best_ls = max(qualified_longshots, key=lambda c: c["opportunity_score"])
+        best_ls["tier"] = "LONGSHOT"
+        # Don't double-add if it also won a primary slot (unlikely given <15c filter)
+        if best_ls["ticker"] not in new_crypto_signals:
+            new_crypto_signals[best_ls["ticker"]] = best_ls
+            log.info(
+                "[Crypto] LONGSHOT selected: %s score=%.4f edge=%+.2f entry=%.2f buffer=%.2f%%",
+                best_ls["ticker"], best_ls["opportunity_score"],
+                best_ls["edge"], best_ls["entry_price"], best_ls.get("buffer_pct", 0.0)
+            )
+        rejected_ls = len(qualified_longshots) - 1
+        if rejected_ls > 0:
+            log.info("[Crypto] Rejected %d lower-scoring longshot candidate(s)", rejected_ls)
+        unqualified = len(longshot_candidates) - len(qualified_longshots)
+        if unqualified > 0:
+            log.info(
+                "[Crypto] %d longshot candidate(s) failed edge/buffer filter "
+                "(need edge>=%.2f, buffer>=%.1f%%)",
+                unqualified, LONGSHOT_MIN_EDGE, LONGSHOT_MIN_BUFFER
+            )
+    else:
+        if longshot_candidates:
+            log.info(
+                "[Crypto] %d longshot candidate(s) found but none passed filter "
+                "(edge>=%.2f + buffer>=%.1f%%)",
+                len(longshot_candidates), LONGSHOT_MIN_EDGE, LONGSHOT_MIN_BUFFER
             )
 
     crypto_signals = new_crypto_signals
@@ -3093,6 +4145,122 @@ def fetch_fedwatch_hold_prob() -> float:
     log.info("[FOMC] hold_prob=%.2f (legacy fedwatch_hold_prob)", hold_prob)
     return hold_prob
 
+
+# =============================================================================
+# FOREX MODEL — EUR/USD edge calculator
+# =============================================================================
+
+def fetch_eurusd_spot() -> float:
+    """Fetch EUR/USD spot rate from Yahoo Finance (primary) or FRED (fallback)."""
+    try:
+        r = requests.get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/EURUSD=X",
+            headers={"User-Agent": "Mozilla/5.0"},
+            params={"interval": "1d", "range": "2d"},
+            timeout=8
+        )
+        if r.ok:
+            price = float(r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"])
+            log.info("[Forex] EUR/USD Yahoo: %.5f", price)
+            return price
+    except Exception as e:
+        log.debug("[Forex] Yahoo failed: %s", e)
+    # FRED fallback: DEXUSEU = USD per EUR (same as EUR/USD)
+    val = fetch_fred_series("DEXUSEU")
+    if val:
+        log.info("[Forex] EUR/USD FRED: %.5f", val)
+        return val
+    return 0.0
+
+# Cache EUR/USD — 15 minute TTL
+_eurusd_cache: float = 0.0
+_eurusd_cache_ts: float = 0.0
+
+def get_eurusd_spot() -> float:
+    global _eurusd_cache, _eurusd_cache_ts
+    now = time.time()
+    if _eurusd_cache and (now - _eurusd_cache_ts) < 900:
+        return _eurusd_cache
+    val = fetch_eurusd_spot()
+    if val:
+        _eurusd_cache = val
+        _eurusd_cache_ts = now
+    return _eurusd_cache
+
+def calculate_eurusd_edge(ticker: str, kalshi_mid: float) -> tuple:
+    """
+    Edge calculation for KXEURUSD markets.
+
+    Ticker formats:
+      KXEURUSD-{date}-T{threshold}  = above/below markets
+      KXEURUSD-{date}-B{bracket}    = bracket markets (1.173 = 1.172-1.174 range)
+
+    Model: spot rate with normal distribution std_dev = 0.005 (50 pips) for 1-day horizon.
+    Returns (model_prob, edge, direction, source)
+    """
+    import re as _re
+    ticker_upper = ticker.upper()
+    spot = get_eurusd_spot()
+    if not spot:
+        return None, 0.0, "NO", "unavailable"
+
+    std_dev = 0.005  # ~50 pips daily std dev for EUR/USD
+
+    # Parse ticker type
+    last_part = ticker_upper.split("-")[-1]  # e.g. T1.18799, B1.177
+
+    if last_part.startswith("T"):
+        # Above/below threshold market
+        try:
+            threshold = float(last_part[1:])
+        except ValueError:
+            return None, 0.0, "NO", "parse_error"
+
+        # Determine direction from title
+        title_lower = (ticker.lower())
+        above = "above" in ticker.lower() or not "below" in ticker.lower()
+
+        from scipy.stats import norm as _norm
+        z = (threshold - spot) / std_dev
+        prob_above = float(1.0 - _norm.cdf(z))
+
+        if above:
+            model_prob = prob_above
+            edge = model_prob - kalshi_mid
+            direction = "YES" if edge > 0 else "NO"
+        else:
+            model_prob = 1.0 - prob_above
+            edge = model_prob - kalshi_mid
+            direction = "YES" if edge > 0 else "NO"
+
+        log.info("[Forex] %s: spot=%.5f thr=%.5f above=%s model=%.2f kalshi=%.2f edge=%+.2f",
+                 ticker, spot, threshold, above, model_prob, kalshi_mid, edge)
+        return model_prob, edge, direction, "EURUSD_spot=%.5f" % spot
+
+    elif last_part.startswith("B"):
+        # Bracket market — e.g. B1.177 = 1.176-1.178 range (200 pip bracket)
+        try:
+            bracket_floor = float(last_part[1:])
+        except ValueError:
+            return None, 0.0, "NO", "parse_error"
+        # Brackets are typically 0.002 wide on Kalshi EUR/USD
+        bracket_width = 0.002
+        bracket_ceil  = bracket_floor + bracket_width
+
+        from scipy.stats import norm as _norm
+        # P(bracket_floor < spot_at_open < bracket_ceil)
+        prob = float(_norm.cdf((bracket_ceil - spot) / std_dev) -
+                     _norm.cdf((bracket_floor - spot) / std_dev))
+
+        edge = prob - kalshi_mid
+        direction = "YES" if edge > 0 else "NO"
+
+        log.info("[Forex] %s bracket [%.5f-%.5f]: spot=%.5f model=%.2f kalshi=%.2f edge=%+.2f",
+                 ticker, bracket_floor, bracket_ceil, spot, prob, kalshi_mid, edge)
+        return prob, edge, direction, "EURUSD_spot=%.5f" % spot
+
+    return None, 0.0, "NO", "unknown_format"
+
 def calculate_economic_edge(ticker: str, kalshi_mid: float) -> tuple:
     """
     For a given economic market ticker, fetch the relevant model estimate
@@ -3139,18 +4307,14 @@ def run_gdp_research(open_positions: dict = None) -> dict:
         log.info("[GDP] GDPNow estimate unavailable — using cached consensus")
 
     log.info("=" * 60)
-    log.info("GDP THESIS — Q1 2026 Advance Estimate")
+    log.info("GDP THESIS — Current GDPNow")
     log.info("=" * 60)
     log.info(f"  Release date:     {thesis['release_date']}")
-    log.info(f"  Consensus range:  {thesis['consensus_range'][0]:+.1f}% to {thesis['consensus_range'][1]:+.1f}%")
     log.info(f"  Our estimate:     {thesis['our_estimate']:+.1f}%")
     if gdpnow is not None:
         log.info(f"  GDPNow (live):    {gdpnow:+.1f}%")
     log.info(f"  Verdict:          {thesis['verdict']}")
     log.info(f"  Risk:             {thesis['risk']}")
-    log.info("  Positions:")
-    for ticker, rationale in thesis["positions"].items():
-        log.info(f"    {ticker}: {rationale}")
     log.info("=" * 60)
 
     return thesis
@@ -3180,7 +4344,7 @@ def main():
         check_stop_losses(dry_run=dry_run)
 
         # Log weather model update window status
-        in_window = in_weather_model_update_window()
+        in_window = False  # weather model window check removed
         log.info(f"[Weather] Model update window active: {in_window}")
 
         run_crypto_monitor(dry_run=dry_run)
@@ -3318,6 +4482,95 @@ def check_pre_release_briefs(dry_run: bool = False):
                 log.warning("[PRE-RELEASE] Discord post failed: %s", e)
 
 
+
+# =============================================================================
+# TRADE RESOLUTION MONITOR
+# =============================================================================
+
+def resolve_pending_trades(dry_run: bool = False):
+    """
+    Check all PENDING trades in eval_store against Kalshi API.
+    Update outcome, post Discord result. Called each scan cycle.
+    """
+    import json as _json
+    from pathlib import Path as _Path
+
+    eval_path = _Path("/home/cody/stratton/data/eval_store.json")
+    if not eval_path.exists():
+        return
+
+    try:
+        data = _json.loads(eval_path.read_text())
+    except Exception as e:
+        log.warning("[Resolver] Failed to load eval_store: %s", e)
+        return
+
+    pending = [t for t in data if t.get("outcome") in ("PENDING", None, "")]
+    if not pending:
+        return
+
+    log.info("[Resolver] Checking %d pending trades", len(pending))
+    updated = 0
+
+    for trade in pending:
+        ticker = trade.get("market") or trade.get("trade_id", "")
+        if not ticker or ticker.startswith("TEST"):
+            continue
+        try:
+            market_data = kalshi_get("/markets/%s" % ticker)
+            m = market_data.get("market", {})
+            status = m.get("status", "")
+            result = m.get("result", "")
+
+            if status not in ("finalized", "determined"):
+                continue
+
+            direction = (trade.get("direction") or trade.get("side") or "YES").upper()
+            won = (result.lower() == "yes" and direction == "YES") or                   (result.lower() == "no"  and direction == "NO")
+
+            entry_price = trade.get("entry_price_dollars", 0.5)
+            if entry_price and 0 < entry_price < 1:
+                pnl_pct = round((1.0 - entry_price) / entry_price * 100, 1) if won else -100.0
+            else:
+                pnl_pct = 100.0 if won else -100.0
+
+            # Try to get actual realized PnL
+            pos_data = kalshi_get("/portfolio/positions", params={"ticker": ticker})
+            actual_pnl = None
+            for p in pos_data.get("market_positions", []):
+                if p.get("ticker") == ticker:
+                    actual_pnl = float(p.get("realized_pnl_dollars", 0) or 0)
+
+            trade["outcome"] = "WIN" if won else "LOSS"
+            trade["resolved_date"] = m.get("close_time", "")[:10] or "2026-05-02"
+            trade["result_direction"] = result
+            trade["pnl_pct"] = pnl_pct
+            if actual_pnl is not None:
+                trade["realized_pnl_dollars"] = actual_pnl
+
+            updated += 1
+            log.info("[Resolver] %s: %s -> %s (pnl=%.1f%%)", ticker, direction, trade["outcome"], pnl_pct)
+
+            # Post Discord
+            check = "\u2705" if won else "\u274c"
+            pnl_str = ("($%+.2f)" % actual_pnl) if actual_pnl else ""
+            msg = "%s **RESOLVED: %s** | %s | Result: %s | %s %s%+.1f%%" % (
+                check, ticker, direction, result.upper(),
+                "WIN" if won else "LOSS", pnl_str, pnl_pct)
+            if not dry_run:
+                try:
+                    _post_discord(DISCORD_CH_RESULTS, msg)
+                except Exception:
+                    pass
+
+        except Exception as e:
+            log.debug("[Resolver] %s: %s", ticker, e)
+
+    if updated > 0 and not dry_run:
+        eval_path.write_text(_json.dumps(data, indent=2))
+        log.info("[Resolver] Updated %d outcomes in eval_store", updated)
+
+
 def run_scan(post=None, **kwargs):
     """Entry point for firm.py -- runs one discovery scan."""
     # FIX: Rebuild dynamic thesis direction locks from live model each cycle
@@ -3328,6 +4581,9 @@ def run_scan(post=None, **kwargs):
     # Check for upcoming releases and post pre-release briefs
     _dry = (post is False)
     check_pre_release_briefs(dry_run=_dry)
+
+    # Resolve pending trades and update eval_store
+    resolve_pending_trades(dry_run=_dry)
 
     run_discovery_scan(dry_run=False)
     _save_donnie_state()

@@ -100,6 +100,8 @@ def save_state(state: dict):
 
 # ── Discord helper ──────────────────────────────────────────────────────────
 def post_discord(channel_id: int, content: str, token: str = None) -> bool:
+    if OPTIONS_DISCORD_MUTED:
+        return True  # silenced
     tok = token or JORDAN_TOKEN
     if not tok:
         print(f"[OPTIONS] ERROR: No token", file=sys.stderr)

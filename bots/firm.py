@@ -68,11 +68,11 @@ CHANNELS = {
 
 # ── Scanner schedule (minutes between runs) ─────────────────────────────────
 SCHEDULE = {
-    'kalshi':    120,   # Economics: every 2 hours
-    'sports':    15,    # Sports: every 15 min (matches stink bid refresh cadence)
+    'kalshi':    30,    # Economics: every 30 min — commodity/crypto markets need fresh discovery
+    'sports':    15,    # Sports: every 15 min (paper, Discord muted)
     'congress':  240,      # Congressional: every 4 hours
     'whale':     999999,   # Crypto: every 30 min
-    'options':   15,       # Options: price target monitor every 15 min
+    'options':   999999,    # Options: DISABLED until SPY positions loaded (was 15 min)
     'research':  999999, # Weather Intel: weekly (7 days in minutes)
     'weather':   3,      # Weather bot: every 3 minutes
     'supervisor': 30,   # Supervisor heartbeat: every 30 min
@@ -390,12 +390,49 @@ def handle_command(command: str, args: list = None) -> str:
 
 
 # ── Scheduler loop ───────────────────────────────────────────────────────────
+# Fixed clock slots for kalshi economics scanner (UTC)
+# Runs at :15 and :45 of every hour — always 15min before/after hour-close markets
+KALSHI_FIXED_MINUTES = {15, 45}
+
+def _kalshi_due(now_dt) -> bool:
+    """Return True if current UTC minute is a kalshi scheduled slot and not yet run this slot."""
+    slot_key = "%s-%02d" % (now_dt.strftime("%Y-%m-%dT%H"), (now_dt.minute // 30) * 30)
+    if now_dt.minute not in KALSHI_FIXED_MINUTES:
+        return False
+    # Only fire once per slot (track by slot key in _last_run)
+    last = _last_run.get("kalshi_slot", "")
+    return last != slot_key
+
 def scheduler_loop():
     global _running
     log.info("[FIRM] Scheduler started.")
     while _running:
         now = time.time()
+        from datetime import datetime as _dt, timezone as _tz
+        now_dt = _dt.fromtimestamp(now, tz=_tz.utc)
+
         for name, interval_minutes in SCHEDULE.items():
+            # Economics/kalshi: use fixed clock slots (:15 and :45 UTC)
+            if name == "kalshi":
+                if _kalshi_due(now_dt):
+                    slot_key = "%s-%02d" % (now_dt.strftime("%Y-%m-%dT%H"), (now_dt.minute // 30) * 30)
+                    _last_run["kalshi_slot"] = slot_key
+                    _last_run[name] = now
+                    log.info("[FIRM] [KALSHI] Fixed-slot scan triggered at %s UTC" % now_dt.strftime("%H:%M"))
+                    scanner_fn = SCANNERS.get(name)
+                    if scanner_fn:
+                        lock = get_scanner_lock(name)
+                        if lock.locked():
+                            log.debug("[FIRM] kalshi scanner still running — skipping slot")
+                        else:
+                            def _run_kalshi(fn=scanner_fn, lk=lock):
+                                with lk:
+                                    fn()
+                            t = threading.Thread(target=_run_kalshi, daemon=True, name="scanner-kalshi")
+                            t.start()
+                continue
+
+            # All other scanners: use existing relative interval logic
             interval_seconds = interval_minutes * 60
             if now - _last_run[name] >= interval_seconds:
                 _last_run[name] = now
@@ -410,7 +447,7 @@ def scheduler_loop():
                                 fn()
                         t = threading.Thread(target=_run_with_lock, daemon=True, name=f"scanner-{name}")
                         t.start()
-        time.sleep(60)  # check every minute
+        time.sleep(30)  # check every 30s for better slot precision
 
 
 # ── Discord gateway (lightweight polling — no discord.py required) ───────────
