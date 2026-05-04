@@ -77,6 +77,7 @@ SCHEDULE = {
     'weather':   3,      # Weather bot: every 3 minutes
     'supervisor': 30,   # Supervisor heartbeat: every 30 min
     'eval': 10080,      # Eval Framework: weekly (7 days in minutes)
+    'btc_watch': 5,     # BTC price watcher: every 5 min
 }
 
 # Track last run timestamps
@@ -299,6 +300,26 @@ def run_eval_report():
         log.exception('[EVAL] Weekly report failed')
 
 
+
+def run_btc_watch_scanner():
+    """Lightweight BTC price monitor. Triggers crypto scan on momentum conditions."""
+    log.info("[BTC_WATCH] Running BTC price check...")
+    try:
+        donnie_path = os.path.join(BOT_DIR, 'economics.py')
+        mod = load_module("economics", donnie_path)
+        if mod and hasattr(mod, 'update_btc_price_history'):
+            result = mod.update_btc_price_history()
+            if result.get('triggered'):
+                log.info("[BTC_WATCH] MOMENTUM SIGNAL: %s — triggering immediate Kalshi scan",
+                         result.get('reason', ''))
+                # Trigger the kalshi scanner immediately
+                run_kalshi_scanner()
+        else:
+            log.warning("[BTC_WATCH] update_btc_price_history not available")
+    except Exception as e:
+        log.error("[BTC_WATCH] Failed: %s", e)
+
+
 # Map scanner names to functions
 SCANNERS = {
     'kalshi':   run_kalshi_scanner,
@@ -310,6 +331,7 @@ SCANNERS = {
     'weather':  run_weather_scanner,
     'supervisor': run_supervisor,
     'eval': run_eval_report,
+    'btc_watch': run_btc_watch_scanner,
 }
 
 

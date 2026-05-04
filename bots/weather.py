@@ -71,6 +71,7 @@ WEATHER_PAPER_TRADES_FILE = os.path.join(DATA_DIR, "weather_paper_trades.json")
 FORECAST_CACHE_FILE       = os.path.join(DATA_DIR, "weather_forecast_cache.json")
 PAPER_DEDUP_FILE          = os.path.join(DATA_DIR, "weather_paper_dedup.json")
 LIVE_DEDUP_FILE           = os.path.join(DATA_DIR, "weather_live_dedup.json")
+POSITION_SNAPSHOTS_FILE   = os.path.join(DATA_DIR, "weather_position_snapshots.json")
 PAPER_EXPERIMENTS_FILE    = os.path.join(DATA_DIR, "weather_experiments.json")
 WEATHER_ACCURACY_FILE     = os.path.join(DATA_DIR, "weather_accuracy.json")
 BIAS_CACHE_FILE           = os.path.join(DATA_DIR, "weather_bias_cache.json")
@@ -150,6 +151,39 @@ WEATHER_EDGE_MAX          = 0.65   # cap - above this kalshi is near certain, mo
 MIN_FORECAST_MARGIN_MULT  = 1.5    # forecast must be >= this * uncertainty from threshold to signal
 MAX_ACTIVE_WEATHER_ORDERS = 16     # max simultaneous LIVE positions
 MAX_POSITIONS_PER_CITY    = 2      # max open positions per city (correlation risk)
+# Typical daily high peak hour (local time) per city, based on climate norms
+# Execution blocked for same-day markets after peak_hour + 3h local time
+# UTC offset for each city (standard time; summer is -1 for most)
+CITY_UTC_OFFSETS = {
+    'New York': -4, 'Boston': -4, 'Atlanta': -4, 'Miami': -4,
+    'Washington DC': -4, 'Philadelphia': -4,
+    'Chicago': -5, 'Dallas': -5, 'Houston': -5, 'Minneapolis': -5,
+    'Austin': -5, 'New Orleans': -5, 'Oklahoma City': -5, 'San Antonio': -5,
+    'Phoenix': -7, 'Las Vegas': -7,
+    'Los Angeles': -7, 'San Francisco': -7, 'Seattle': -7,
+}
+
+CITY_PEAK_HOURS = {
+    'New York': 15,        # 3 PM ET
+    'Los Angeles': 14,     # 2 PM PT
+    'Chicago': 15,         # 3 PM CT
+    'Miami': 14,           # 2 PM ET
+    'Dallas': 15,          # 3 PM CT
+    'Houston': 15,         # 3 PM CT
+    'Boston': 15,          # 3 PM ET
+    'Atlanta': 15,         # 3 PM ET
+    'Phoenix': 16,         # 4 PM MT
+    'Las Vegas': 15,       # 3 PM PT
+    'Seattle': 15,         # 3 PM PT
+    'Minneapolis': 15,     # 3 PM CT
+    'Austin': 15,          # 3 PM CT
+    'Washington DC': 15,   # 3 PM ET
+    'New Orleans': 15,     # 3 PM CT
+    'Oklahoma City': 15,   # 3 PM CT
+    'San Francisco': 15,   # 3 PM PT
+    'San Antonio': 15,     # 3 PM CT
+    'Philadelphia': 15,    # 3 PM ET
+}
 MAX_PAPER_SIGNALS         = 10     # max paper signals per scan cycle (prevent spam)
 MAX_POSITION_PCT          = 0.03   # fallback only — dynamic sizing used in live mode
 DAILY_LIVE_BUDGET         = 100.0  # total dollars to deploy per day across all signals
@@ -904,6 +938,39 @@ def _mark_prefetch_done():
         log.warning("[Prefetch] Could not write lock file: %s", e)
 
 
+_aigefs_bg_running = False
+
+def prefetch_aigefs_background():
+    """
+    Fetch AIGEFS data for all 19 cities in a background thread.
+    Called after main prefetch completes. Never blocks scanning.
+    """
+    global _aigefs_bg_running
+    if _aigefs_bg_running:
+        log.debug("[AIGEFS-BG] Already running — skipping")
+        return
+    _aigefs_bg_running = True
+    try:
+        log.info("[AIGEFS-BG] Starting background AIGEFS fetch for all %d series", len(WEATHER_SERIES))
+        now_ts = time.time()
+        loaded = 0
+        for series in WEATHER_SERIES:
+            city = SERIES_CITY_MAP.get(series)
+            if not city:
+                continue
+            try:
+                aigefs_data = _fetch_aigefs_daily(series, city)
+                if aigefs_data:
+                    key = "aigefs_%s" % series
+                    _forecast_mem_cache[key] = {'data': aigefs_data, 'ts': now_ts}
+                    loaded += 1
+            except Exception as e:
+                log.debug("[AIGEFS-BG] %s: %s", series, e)
+        log.info("[AIGEFS-BG] Done: %d/%d cities loaded", loaded, len(WEATHER_SERIES))
+    finally:
+        _aigefs_bg_running = False
+
+
 def prefetch_all_forecasts():
     """
     Fetch forecasts for all 19 cities from Tomorrow.io and Open-Meteo.
@@ -970,15 +1037,7 @@ def prefetch_all_forecasts():
             log.debug("[Prefetch] Ensemble %s: %s", series, e)
         time.sleep(0.05)
 
-        # AIGEFS (AI-augmented GFS ensemble — optional third source)
-        try:
-            aigefs_data = _fetch_aigefs_daily(series, city)
-            if aigefs_data:
-                key = "aigefs_%s" % series
-                disk_cache[key] = {'data': aigefs_data, 'ts': now_ts}
-                _forecast_mem_cache[key] = {'data': aigefs_data, 'ts': now_ts}
-        except Exception as e:
-            log.debug("[Prefetch] AIGEFS %s: %s", series, e)
+        # AIGEFS runs in background thread (see prefetch_aigefs_background)
 
     # Write updated disk cache
     try:
@@ -999,6 +1058,8 @@ def prefetch_all_forecasts():
 
     if success_t + success_o + success_e_total > 0:
         _mark_prefetch_done()
+        import threading as _thr
+        _thr.Thread(target=prefetch_aigefs_background, daemon=True).start()
 
     return success_t, success_o
 
@@ -2072,7 +2133,59 @@ def resolve_open_trades():
         # Append to accuracy log
         _append_accuracy(accuracy_entries)
 
+        # Update weather_live_pnl.json with outcomes
+        _resolve_live_pnl(results)
+
     return changed
+
+
+def _resolve_live_pnl(results: dict):
+    """Update weather_live_pnl.json with settlement outcomes."""
+    try:
+        pnl_file = os.path.join(DATA_DIR, "weather_live_pnl.json")
+        if not os.path.exists(pnl_file):
+            return
+        with open(pnl_file) as f:
+            pnl_data = json.load(f)
+        trade_list = pnl_data.get("trades", [])
+        changed = False
+        for t in trade_list:
+            ticker = t.get("ticker")
+            if ticker not in results or t.get("status") not in ("OPEN", None):
+                continue
+            market_result = results[ticker]
+            direction = t.get("side", "NO").upper()
+            won = (direction == "YES" and market_result == "yes") or \
+                  (direction == "NO" and market_result == "no")
+            t["status"] = "WIN" if won else "LOSS"
+            t["settled_date"] = datetime.now(ET).strftime("%Y-%m-%d")
+            # Estimate returned: contracts * $1 for win, 0 for loss
+            if t.get("contracts") and won:
+                t["returned"] = round(float(t["contracts"]), 2)
+            else:
+                t["returned"] = 0.0
+            if t.get("cost") is not None:
+                t["pnl"] = round((t["returned"] or 0) - t["cost"], 2)
+            changed = True
+            log.info("[LivePnL] %s: %s returned=$%.2f pnl=$%+.2f",
+                     ticker, t["status"], t.get("returned", 0), t.get("pnl", 0))
+        if changed:
+            # Recompute summary
+            settled = [t for t in trade_list if t.get("status") in ("WIN","LOSS")]
+            wins_list = [t for t in settled if t.get("status") == "WIN"]
+            pnl_data["summary"] = {
+                "total_pnl": round(sum(t.get("pnl",0) or 0 for t in settled), 2),
+                "wins": len(wins_list),
+                "losses": len(settled) - len(wins_list),
+                "win_rate": round(len(wins_list)/len(settled)*100, 1) if settled else 0,
+                "total_cost": round(sum(t.get("cost",0) or 0 for t in settled), 2),
+                "total_returned": round(sum(t.get("returned",0) or 0 for t in settled), 2),
+            }
+            with open(pnl_file, "w") as f:
+                json.dump(pnl_data, f, indent=2)
+            log.info("[LivePnL] Updated %d trades in weather_live_pnl.json", changed)
+    except Exception as e:
+        log.warning("[LivePnL] Update failed: %s", e)
 
 
 def _resolve_experiments(results: dict):
@@ -2478,25 +2591,28 @@ def calc_confidence_score(abs_edge: float, fc_agree: str,
     return total, breakdown
 
 
-def confidence_to_bet_size(score: float) -> float:
+def confidence_to_bet_size(score: float, balance: float = None) -> float:
     """
-    Maps confidence score (0-100) to bet size in dollars.
-    - 0-40:   MIN_BET_SIZE ($2.50)
-    - 40-55:  $5.00
-    - 55-70:  $8.00
-    - 70-85:  $12.00
-    - 85-100: MAX_BET_SIZE ($15.00)
+    Kelly Criterion-based dynamic bet sizing.
+    Base: 7% of balance (quarter Kelly at ~57% win rate / 1.5x odds).
+    Scaled by confidence multiplier (0.3x low confidence, 1.4x high).
+    Auto-scales with balance so returns stay proportional as account grows.
     """
+    if balance is None or balance <= 0:
+        balance = DAILY_LIVE_BUDGET * 3
+    quarter_kelly_base = balance * 0.07
     if score >= 85:
-        return MAX_BET_SIZE
+        multiplier = 1.4
     elif score >= 70:
-        return 12.00
+        multiplier = 1.15
     elif score >= 55:
-        return 8.00
+        multiplier = 0.9
     elif score >= 40:
-        return 5.00
+        multiplier = 0.6
     else:
-        return MIN_BET_SIZE
+        multiplier = 0.3
+    bet = quarter_kelly_base * multiplier
+    return min(MAX_BET_SIZE, max(MIN_BET_SIZE, round(bet, 2)))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ASOS REAL-TIME OBSERVATIONS — live readings from exact settlement stations
@@ -2546,6 +2662,83 @@ def fetch_asos_observation(series: str) -> dict:
     return {}
 
 
+
+def fetch_today_high(series: str) -> dict:
+    """
+    Pull today's hourly NWS observations for the exact settlement station.
+    Returns running max (confirmed high so far today) + current temp.
+
+    This is the same data source Kalshi uses for settlement.
+    Free, no key, 5-minute updates.
+
+    Returns {} on failure -- never blocks execution.
+    """
+    city = SERIES_CITY_MAP.get(series, {})
+    station = city.get('asos')  # e.g. 'KNYC', 'KMIA', 'KMDW'
+    if not station:
+        return {}
+
+    # Cache key: today_high_{station}
+    now = time.time()
+    cache_key = 'today_high_%s' % station
+    cached = _asos_cache.get(cache_key)
+    if cached and (now - cached.get('cache_ts', 0)) < _ASOS_TTL:
+        return cached
+
+    # Build time window: from 06:00 UTC today (or yesterday if before 06:00 UTC)
+    now_utc = datetime.now(timezone.utc)
+    if now_utc.hour < 6:
+        # Before 06:00 UTC -- use yesterday's 06:00 UTC as start
+        from datetime import timedelta as _td
+        _start_date = (now_utc - _td(days=1)).strftime('%Y-%m-%d')
+    else:
+        _start_date = now_utc.strftime('%Y-%m-%d')
+    today_start = _start_date + 'T06:00:00Z'
+    today_end = now_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    try:
+        r = requests.get(
+            'https://api.weather.gov/stations/%s/observations' % station,
+            params={'start': today_start, 'end': today_end, 'limit': 50},
+            headers={'User-Agent': 'StrattonOakmont-WeatherBot/1.0'},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return {}
+
+        features = r.json().get('features', [])
+        temps_f = []
+        latest_ts = ''
+
+        for obs in features:
+            props = obs.get('properties', {})
+            tc = props.get('temperature', {}).get('value')
+            ts = props.get('timestamp', '')[:16]
+            if tc is not None:
+                temps_f.append(tc * 9/5 + 32)
+                if not latest_ts:
+                    latest_ts = ts  # features sorted newest first
+
+        if not temps_f:
+            return {}
+
+        result = {
+            'current_f': round(temps_f[0], 1),       # most recent
+            'running_max_f': round(max(temps_f), 1),  # confirmed high so far
+            'obs_count': len(temps_f),
+            'ts': latest_ts,
+            'station': station,
+            'cache_ts': now,
+        }
+        _asos_cache[cache_key] = result
+        log.debug('[NWS] %s (%s): current=%.1fF running_max=%.1fF obs=%d',
+                  series, station, result['current_f'], result['running_max_f'], result['obs_count'])
+        return result
+    except Exception as e:
+        log.debug('[NWS] %s failed: %s', station, e)
+    return {}
+
+
 def get_asos_adjusted_forecast(series: str, date: str,
                                 forecast_high: float) -> tuple:
     """
@@ -2561,6 +2754,14 @@ def get_asos_adjusted_forecast(series: str, date: str,
     today = datetime.now(ET).strftime('%Y-%m-%d')
     if date != today:
         return forecast_high, 'model_only'  # ASOS only useful for today's market
+
+    # NEW: also pull today's confirmed running max from hourly NWS observations
+    today_data = fetch_today_high(series)
+    running_max = today_data.get('running_max_f')
+
+    if running_max and running_max > forecast_high:
+        log.debug("[ASOS] %s: upgrading forecast %.1fF -> %.1fF (today running max)", series, forecast_high, running_max)
+        return running_max, 'asos_running_max'
 
     current = obs.get('current_f')
     max24   = obs.get('max_f')
@@ -2603,7 +2804,136 @@ def get_orderbook_signal(market: dict) -> tuple:
     return imbalance, spread_pct, volume
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# INTRADAY POSITION DRIFT TRACKER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def log_position_snapshots():
+    """
+    For each open weather position, snapshot current Kalshi price + ASOS reading.
+    Called each scan cycle. Used later to analyze:
+    - How quickly markets reprice toward our thesis (edge decay)
+    - When to take profit vs hold to settlement
+    - Whether ASOS intraday trend predicts final outcome
+    No execution logic — pure data collection.
+    """
+    try:
+        pos = get_open_weather_positions()
+        if not pos:
+            return
+
+        now_str = datetime.now(ET).isoformat()
+        snapshots = []
+
+        for ticker in pos:
+            try:
+                # Current Kalshi price
+                market_data = kalshi_get("/markets/%s" % ticker)
+                m = market_data.get("market", market_data)
+                yes_bid = float(m.get("yes_bid_dollars") or 0)
+                yes_ask = float(m.get("yes_ask_dollars") or 1)
+                no_mid = round(1 - (yes_bid + yes_ask) / 2, 3)
+                result = m.get("result", "")
+                status = m.get("status", "")
+
+                # ASOS reading for this city
+                series = next((s for s in SERIES_CITY_MAP if ticker.startswith(s + "-")), None)
+                asos_temp = None
+                asos_running_max = None
+                if series:
+                    obs = fetch_asos_observation(series)
+                    asos_temp = obs.get("current_f")
+                    today_obs = fetch_today_high(series)
+                    asos_running_max = today_obs.get("running_max_f")
+
+                snapshot = {
+                    "ticker": ticker,
+                    "ts": now_str,
+                    "no_mid": no_mid,
+                    "yes_bid": round(yes_bid, 3),
+                    "yes_ask": round(yes_ask, 3),
+                    "asos_f": round(asos_temp, 1) if asos_temp else None,
+                    "running_max_f": round(asos_running_max, 1) if asos_running_max else None,
+                    "market_status": status,
+                    "result": result if result else None,
+                }
+                snapshots.append(snapshot)
+                time.sleep(0.05)
+            except Exception as e:
+                log.debug("[Snapshot] %s: %s", ticker, e)
+
+        if not snapshots:
+            return
+
+        # Append to snapshots file
+        try:
+            existing = []
+            if os.path.exists(POSITION_SNAPSHOTS_FILE):
+                with open(POSITION_SNAPSHOTS_FILE) as f:
+                    existing = json.load(f)
+            existing.extend(snapshots)
+            # Keep last 7 days only (prevent unbounded growth)
+            cutoff = (datetime.now(ET) - timedelta(days=7)).isoformat()
+            existing = [s for s in existing if s.get("ts", "") >= cutoff]
+            with open(POSITION_SNAPSHOTS_FILE, "w") as f:
+                json.dump(existing, f)
+            log.debug("[Snapshot] Logged %d position snapshots", len(snapshots))
+        except Exception as e:
+            log.debug("[Snapshot] Write failed: %s", e)
+
+    except Exception as e:
+        log.debug("[Snapshot] Failed: %s", e)
+
+
 _scan_lock = __import__('threading').Lock()
+
+def compute_brier_score(window_days: int = 30) -> dict:
+    """
+    Compute Brier Score from accuracy log.
+    Brier Score = mean((model_prob - actual_outcome)^2)
+    0.00 = perfect calibration, 0.25 = random, higher = worse than random.
+    """
+    try:
+        if not os.path.exists(WEATHER_ACCURACY_FILE):
+            return {}
+        with open(WEATHER_ACCURACY_FILE) as f:
+            entries = json.load(f)
+        
+        from datetime import datetime, timezone, timedelta
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=window_days)).strftime('%Y-%m-%d')
+        entries = [e for e in entries if e.get('date', '') >= cutoff]
+        resolved = [e for e in entries if e.get('market_result') in ('yes', 'no')]
+        
+        if not resolved:
+            return {'brier': None, 'n': 0}
+        
+        scores = []
+        by_dir = {'YES': [], 'NO': []}
+        
+        for e in resolved:
+            mp = e.get('model_prob', 0.5)
+            actual = 1 if e.get('market_result') == 'yes' else 0
+            b = (mp - actual) ** 2
+            scores.append(b)
+            direction = e.get('direction', '')
+            if direction in by_dir:
+                by_dir[direction].append(b)
+        
+        result = {
+            'brier': round(sum(scores) / len(scores), 4),
+            'n': len(scores),
+            'window_days': window_days,
+            'by_direction': {
+                d: round(sum(v)/len(v), 4) if v else None
+                for d, v in by_dir.items()
+            }
+        }
+        log.debug("[Brier] Score=%.4f (n=%d, %dd window)", result['brier'], result['n'], window_days)
+        return result
+    except Exception as e:
+        log.debug("[Brier] Compute failed: %s", e)
+        return {}
+
 
 def run_weather_scan(dry_run: bool = False) -> dict:
     """
@@ -2950,6 +3280,43 @@ def run_weather_scan(dry_run: bool = False) -> dict:
                 log.debug("[Live] %s is future market (%s) - skip, re-evaluate tomorrow morning", ticker, market_date)
                 continue
 
+            # Smart per-city peak-aware execution guard
+            if market_date == today_et:
+                _city = city_name
+                _peak_hour_local = CITY_PEAK_HOURS.get(_city, 15)  # default 3 PM
+                _utc_offset = CITY_UTC_OFFSETS.get(_city, -5)       # default CT
+                _cutoff_hour_utc = (_peak_hour_local - _utc_offset) % 24 + 3  # peak + 3h in UTC
+                _now_utc = datetime.now(timezone.utc)
+                _now_utc_hour = _now_utc.hour + _now_utc.minute / 60
+                # Compare in city local time to avoid midnight UTC wraparound
+                _now_local_hour = (_now_utc_hour + _utc_offset) % 24
+                _cutoff_local = (_peak_hour_local + 3) % 24
+                if _now_local_hour >= _cutoff_local:
+                    log.info("[Live] %s: past peak+3h cutoff for %s (peak %d local, cutoff %.1f UTC) -- skip",
+                             ticker, _city, _peak_hour_local, _cutoff_hour_utc % 24)
+                    continue
+
+                # ASOS proximity check: if ASOS within 2F of bracket, high may already be set
+                if series:
+                    _obs = fetch_asos_observation(series)
+                    _today_obs = fetch_today_high(series)
+                    # Use running_max for proximity check -- more accurate than current_f alone
+                    _asos_now = _today_obs.get("running_max_f") or _obs.get("current_f")
+                    if _asos_now is not None:
+                        _st = parsed.get("strike_type", "")
+                        _thresh = parsed.get("threshold")
+                        _lo = parsed.get("low"); _hi = parsed.get("high")
+                        _asos_risk = False
+                        if _st in ("less", "greater") and _thresh:
+                            _asos_risk = abs(_asos_now - _thresh) < 2.0
+                        elif _st == "between" and _lo and _hi:
+                            _asos_risk = (_lo - 2.0) <= _asos_now <= (_hi + 2.0)
+                        if _asos_risk:
+                            log.info("[Live] %s: ASOS %.1fF within 2F of bracket -- high may be set, skip", ticker, _asos_now)
+                            continue
+
+
+
             # Per-city cap — max 2 open positions per city (correlation risk)
             city_series = parsed.get("series", "")
             city_open_count = sum(1 for t in weather_positions if t.startswith(city_series + "-"))
@@ -2999,7 +3366,7 @@ def run_weather_scan(dry_run: bool = False) -> dict:
             confidence = min(100, max(0, confidence + ob_bonus + ob_spread_penalty))
             log.info("[Sizing] %s confidence=%.0f ob_imbalance=%.2f ob_spread=%.0f%% breakdown=%s",
                      ticker, confidence, ob_imbalance, ob_spread*100, breakdown)
-            _bet_size = min(confidence_to_bet_size(confidence), _remaining_budget)
+            _bet_size = min(confidence_to_bet_size(confidence, balance), _remaining_budget)
 
             try:
                 result = execute_weather_trade(market, direction, edge, model_prob, balance,
@@ -3009,6 +3376,44 @@ def run_weather_scan(dry_run: bool = False) -> dict:
                     n_open += 1
                     # mark_live_traded already called above before gate
                     record_daily_spend(result.get("cost", 0.0))
+                    # Log full trade context to weather_live_pnl.json
+                    try:
+                        _pnl_file = os.path.join(DATA_DIR, "weather_live_pnl.json")
+                        _pnl_data = {}
+                        if os.path.exists(_pnl_file):
+                            with open(_pnl_file) as _pf: _pnl_data = json.load(_pf)
+                        _pnl_trades = _pnl_data.get("trades", [])
+                        # Check not already logged
+                        if not any(t.get("ticker") == ticker for t in _pnl_trades):
+                            _trade_entry = {
+                                "ticker": ticker,
+                                "city": city_name,
+                                "date": market_date,
+                                "side": direction,
+                                "contracts": result.get("contracts", 0),
+                                "price_cents": result.get("price_c", 0),
+                                "cost": round(result.get("cost", 0.0), 2),
+                                "returned": None,
+                                "pnl": None,
+                                "status": "OPEN",
+                                "settled_date": None,
+                                "confidence": round(confidence, 1),
+                                "confidence_breakdown": breakdown,
+                                "edge_pct": round(abs(edge) * 100, 1),
+                                "fc_agree": fc_agree,
+                                "forecast_high": round(forecast_high, 1),
+                                "uncertainty": round(uncertainty, 2),
+                                "kalshi_mid_cents": round(kalshi_mid * 100, 1),
+                                "ob_imbalance": round(ob_imbalance, 3),
+                                "logged_at": datetime.now(timezone.utc).isoformat(),
+                            }
+                            _pnl_trades.append(_trade_entry)
+                            _pnl_data["trades"] = _pnl_trades
+                            with open(_pnl_file, "w") as _pf: json.dump(_pnl_data, _pf, indent=2)
+                            log.info("[TradeLog] %s logged to weather_live_pnl.json (confidence=%.0f edge=%.0f%% agree=%s)",
+                                     ticker, confidence, abs(edge)*100, fc_agree)
+                    except Exception as _tle:
+                        log.debug("[TradeLog] Failed to log trade: %s", _tle)
                     msg = format_live_msg(ticker, parsed, direction, edge, model_prob,
                                          kalshi_mid, forecast_high, result)
                     post_discord(msg, dry_run=False)
@@ -3035,7 +3440,13 @@ def run_weather_scan(dry_run: bool = False) -> dict:
 
         time.sleep(0.2)
 
-    # ── Daily summary (paper EOD) ────────────────────────────────────────────
+    # ──     # Intraday position drift snapshots
+    try:
+        log_position_snapshots()
+    except Exception:
+        pass
+
+    # Daily summary (paper EOD) ────────────────────────────────────────────
     if dry_run:
         try:
             post_daily_summary()
@@ -3046,6 +3457,14 @@ def run_weather_scan(dry_run: bool = False) -> dict:
     summary["cities_found"] = list(summary["cities_found"])
 
     log.info("=" * 60)
+    # Log Brier score periodically (every ~30 scans)
+    if summary.get("trades", 0) > 0 or (len(summary.get("edges", [])) % 30 == 0 and summary.get("markets_found", 0) > 0):
+        _brier = compute_brier_score(30)
+        if _brier.get("brier") is not None:
+            log.info("[Calibration] Brier=%.4f (n=%d, 30d) | NO=%.4f | higher=worse (random=0.25)",
+                     _brier["brier"], _brier["n"],
+                     _brier["by_direction"].get("NO", 0) or 0)
+
     log.info("SCAN COMPLETE | markets=%d parsed=%d edges=%d trades=%d",
              summary['markets_found'], summary['markets_parsed'],
              len(summary['edges']), summary['trades'])

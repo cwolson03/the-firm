@@ -44,6 +44,24 @@ from datetime import datetime, timezone, timedelta
 from uuid import uuid4
 from typing import Optional
 
+# Fixed paper engine (single-resolution, conservative fill sim)
+try:
+    from paper_engine_fixed import (
+        load_trades as _pe_load_trades,
+        save_trades as _pe_save_trades,
+        create_paper_trade as _pe_create,
+        try_fill_paper_trade as _pe_try_fill,
+        resolve_paper_trade as _pe_resolve,
+        update_open_trades as _pe_update_all,
+        compute_pnl_stats as _pe_stats,
+        TERMINAL_STATUSES as _PE_TERMINAL,
+    )
+    _FIXED_ENGINE = True
+except ImportError:
+    _FIXED_ENGINE = False
+    import logging as _pe_log
+    _pe_log.getLogger("sports").warning("paper_engine_fixed.py not found — using legacy engine")
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PAPER TRADING NOTE
 # ─────────────────────────────────────────────────────────────────────────────
@@ -84,7 +102,7 @@ BRAD_DISCORD_CH  = 1491861968355590242   # #sports-signals
 BRAD_DISCORD_CH2 = 1491861971635540108   # #promo-tracker
 
 # ── Ticker blocklist (secondary guard for non-sports markets) ─────────────────
-BLOCKED_TICKER_PREFIXES = ['KXAAAGASW', 'KXTRUMPSAY', 'KXTRUMPMENTION', 'KXTRUMPUFC', 'KXUFCFIGHT', 'KXUFCWOMEN']  # UFC blocked — 0W/3L, market is efficiently priced by sharp MMA bettors
+BLOCKED_TICKER_PREFIXES = ['KXAAAGASW', 'KXTRUMPSAY', 'KXTRUMPMENTION', 'KXTRUMPUFC', 'KXUFCFIGHT', 'KXUFCWOMEN', 'KXUCLFINALIST', 'KXUCL']  # UFC+UCL blocked from S1/S2 — tournament markets only — 0W/3L, market is efficiently priced by sharp MMA bettors
 
 # ── Strategy definitions ──────────────────────────────────────────────────────
 # S1: Live Game Winners
@@ -2542,10 +2560,19 @@ def run_brad_refresh(dry_run: bool = False, paper: bool = True):
     log.info("-" * 60)
 
     if paper or dry_run:
-        # Paper mode: just run the fill simulation + expiration check
-        check_paper_fills(dry_run=dry_run)
-        check_paper_expirations(dry_run=dry_run)
-        log.info("[Sports] Paper refresh complete: checked for simulated fills and expirations")
+        # Paper mode: use fixed engine if available (single-resolution, conservative fill)
+        if _FIXED_ENGINE:
+            def _fetch_market(ticker):
+                return kalshi_get(f"/markets/{ticker}").get("market", {})
+            def _fetch_result(ticker):
+                return kalshi_get(f"/markets/{ticker}")
+            counts = _pe_update_all(PAPER_TRADES_FILE, _fetch_market, _fetch_result)
+            log.info(f"[Sports] Fixed engine refresh: filled={counts['filled']} won={counts['won']} lost={counts['lost']} expired={counts['expired']} open={counts['still_open']}")
+        else:
+            # Fallback legacy engine
+            check_paper_fills(dry_run=dry_run)
+            check_paper_expirations(dry_run=dry_run)
+            log.info("[Sports] Paper refresh complete (legacy engine)")
         return
 
     # Live mode: cancel and re-place real orders

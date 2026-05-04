@@ -87,6 +87,8 @@ WATCHLIST_SIZE    = 50   # Tier 1 → Tier 2 watchlist
 EXEC_MIN_EDGE_DOLLARS   = 0.18
 EXEC_MAX_PER_POSITION   = 0.35
 EXEC_MAX_TOTAL_DEPLOYED = 0.70
+EXEC_MAX_TOTAL_DOLLARS    = 150.0  # Hard stop: never exceed $150 total exposure regardless of balance
+EXEC_MAX_PER_UNDERLYING   = 30.0   # Max $ per single underlying (WTI, BTC, Gold separately)
 EXEC_POSITION_SIZE_PCT  = 0.05
 MAX_LONGSHOT_DOLLARS    = 8.0    # Max spend on any market priced < 15c (longshot cap)
 
@@ -106,7 +108,17 @@ ORDER_MAX_AGE_HOURS = 2  # auto-cancel stale limit orders older than 2 hours
 
 # --- Crypto/Commodity near-expiry cutoff ---
 CRYPTO_MIN_MINUTES_TO_CLOSE = 30   # never trade crypto/commodity range markets within 30 min of close
-CRYPTO_MIN_BUFFER_PCT        = 0.005  # spot must be >0.5% away from threshold
+CRYPTO_MIN_BUFFER_PCT        = 0.005  # spot must be >0.5% away from threshold (same-day)
+
+# Horizon-scaled buffer minimums — longer horizon needs more buffer because BTC is volatile
+# Daily vol ~1.9%, so N days requires sqrt(N) * 1.9% buffer to maintain same confidence level
+# We use 2x safety margin: buffer_min = 2 * daily_vol * sqrt(days_to_close)
+CRYPTO_BUFFER_DAILY_VOL      = 0.019  # 1.9% daily vol baseline (matches realized vol model)
+CRYPTO_MAX_HORIZON_DAYS      = 2      # never take BTC/ETH positions more than 2 days out
+# Buffer requirements by horizon:
+# same-day (0-1 day): 0.5% minimum
+# 1-2 days: 2.0% minimum  
+# >2 days: BLOCKED entirely
 
 # --- Scheduling ---
 DISCOVERY_SCAN_INTERVAL_SEC   = 1800   # 30 min — full market scan
@@ -260,6 +272,12 @@ crypto_signals: dict = {}
 _prev_btc_spot: float = 0.0
 _prev_eth_spot: float = 0.0
 BTC_MOMENTUM_THRESHOLD = 0.005  # 0.5% move triggers BTC edge scan
+
+# BTC/ETH price history for momentum detection
+_btc_price_history: list = []  # last 12 readings (1h at 5-min intervals)
+_btc_scan_triggered: bool = False  # flag set by watcher, cleared after scan
+_btc_last_trigger_reason: str = ""
+
 MAX_BTC_POSITIONS_PER_CLOSE = 2  # max positions per single close time
 
 # resting order tracker — alerts on fills
@@ -1445,12 +1463,16 @@ def calculate_crypto_edge(ticker: str, kalshi_mid: float) -> tuple:
     if above_match:
         threshold = float(above_match.group(1))
 
-        # ── Buffer check: spot must be >0.5% from threshold (no thin-buffer trades) ──
-        buffer_pct = abs(spot - threshold) / threshold
-        if buffer_pct < 0.005:
-            log.info(
-                f"[Crypto] {ticker}: buffer {buffer_pct*100:.3f}% < 0.5% minimum — no trade"
-            )
+        # Horizon-scaled buffer: longer horizon = more buffer required
+        _close_str = ""
+        try:
+            _md = kalshi_get("/markets/%s" % ticker)
+            _close_str = _md.get("market", {}).get("close_time", "")
+        except Exception:
+            pass
+        _buf_ok, _buf_reason, _ = crypto_horizon_buffer_check(ticker, spot, threshold, _close_str)
+        if not _buf_ok:
+            log.info("[Crypto] %s: %s", ticker, _buf_reason)
             return None, 0.0, "NO", "buffer_too_thin"
 
         pct_above = (spot - threshold) / threshold
@@ -1480,13 +1502,13 @@ def calculate_crypto_edge(ticker: str, kalshi_mid: float) -> tuple:
         direction = "YES" if edge > 0 else "NO"
         log.info(
             f"[CryptoEdge] {ticker} | {asset} spot=${spot:,.0f} thr=${threshold:,.0f} "
-            f"({pct_above:+.1%}) buffer={buffer_pct:.3%} | ann_vol={annualized_vol:.1f}% "
+            f"({pct_above:+.1%}) pct_above={pct_above:.3%} | ann_vol={annualized_vol:.1f}% "
             f"daily_vol={daily_vol*100:.2f}% | model={model_prob:.2f} kalshi={kalshi_mid:.2f} "
             f"edge={edge:+.3f} → {direction}"
         )
         return model_prob, edge, direction, (
             f"spot=${spot:,.0f} thr=${threshold:,.0f} {pct_above:+.1%} "
-            f"vol={annualized_vol:.0f}%ann buffer={buffer_pct:.2%}"
+            f"vol={annualized_vol:.0f}%ann pct={pct_above:.2%}"
         )
 
     return None, 0.0, "NO", "parse_error"
@@ -1551,6 +1573,97 @@ def get_commodity_prices() -> dict:
     else:
         log.warning("[Commodity] No prices from Stooq — all commodity edge calcs will skip")
     return prices
+
+
+# =============================================================================
+# WTI OIL THESIS MODEL — EIA inventory-driven direction signal
+# =============================================================================
+
+def fetch_eia_inventory() -> dict:
+    """
+    Fetch EIA weekly crude oil commercial stocks (Ending Stocks Excluding SPR).
+    Returns dict: current (MBBL), previous (MBBL), change (MBBL), signal, date
+    
+    Inventory draw (negative change) = BULLISH for oil (less supply)
+    Inventory build (positive change) = BEARISH for oil (more supply)
+    """
+    try:
+        r = requests.get("https://api.eia.gov/v2/petroleum/stoc/wstk/data/", params={
+            "api_key": "DEMO_KEY",
+            "frequency": "weekly",
+            "data[0]": "value",
+            "facets[product][]": "EPC0",
+            "facets[duoarea][]": "NUS",
+            # No process filter — filter in code by process-name
+            "sort[0][column]": "period",
+            "sort[0][direction]": "desc",
+            "length": 8,
+        }, timeout=10)
+        if not r.ok:
+            return {}
+        data = r.json().get("response", {}).get("data", [])
+        # Filter to Ending Stocks Excluding SPR specifically
+        # Filter to commercial crude (Ending Stocks Excluding SPR)
+        stocks = [d for d in data if "Excluding SPR" in d.get("process-name", "")]
+        if len(stocks) < 2:
+            return {}
+        curr = float(stocks[0].get("value", 0))
+        prev = float(stocks[1].get("value", 0))
+        chg = curr - prev
+        # Normalize: >3M barrel build = bearish, >3M draw = bullish
+        if chg < -3000:
+            signal = "BULLISH"  # large draw
+        elif chg > 3000:
+            signal = "BEARISH"  # large build
+        elif chg < 0:
+            signal = "SLIGHTLY_BULLISH"
+        else:
+            signal = "SLIGHTLY_BEARISH"
+        result = {
+            "current_mbbl": curr,
+            "previous_mbbl": prev,
+            "change_mbbl": round(chg, 0),
+            "signal": signal,
+            "date": stocks[0].get("period", ""),
+        }
+        log.info("[EIA] Crude inventory: %+.0f MBBL (%s) as of %s",
+                 chg, signal, result["date"])
+        return result
+    except Exception as e:
+        log.warning("[EIA] fetch failed: %s", e)
+        return {}
+
+# Cache EIA data — update weekly (releases every Wednesday)
+_eia_cache: dict = {}
+_eia_cache_ts: float = 0.0
+
+def get_eia_inventory() -> dict:
+    global _eia_cache, _eia_cache_ts
+    now = time.time()
+    if _eia_cache and (now - _eia_cache_ts) < 86400:  # 24h cache
+        return _eia_cache
+    result = fetch_eia_inventory()
+    if result:
+        _eia_cache = result
+        _eia_cache_ts = now
+    return _eia_cache
+
+def get_oil_thesis_direction() -> str:
+    """
+    Returns "BULLISH", "BEARISH", or "NEUTRAL" for WTI based on:
+    1. EIA inventory signal (primary)
+    2. Recent price momentum (secondary)
+    
+    Used to filter WTI Kalshi positions — only trade in direction of thesis.
+    """
+    eia = get_eia_inventory()
+    signal = eia.get("signal", "")
+    
+    if signal in ("BULLISH", "SLIGHTLY_BULLISH"):
+        return "BULLISH"   # Look for YES positions (oil stays above threshold)
+    elif signal in ("BEARISH", "SLIGHTLY_BEARISH"):
+        return "BEARISH"   # Look for NO positions (oil won't hit high threshold)
+    return "NEUTRAL"
 
 def calculate_commodity_edge(ticker: str, kalshi_mid: float) -> tuple:
     """
@@ -1842,10 +1955,13 @@ def classify_market(ticker: str, title: str, category: str, days_until_close_val
     if category in ('Climate and Weather',) or 'temperature' in title_lower or 'weather' in title_lower:
         return 'WEATHER'
 
-    # ── CRYPTO_SHORT — broader crypto (title-based), resolves within 30 days ──
+    # ── CRYPTO_SHORT — only same-day/next-day BTC/ETH (max 2-day horizon) ──
     crypto_patterns = ['bitcoin', 'btc', 'ethereum', 'eth', 'crypto']
-    if any(p in title_lower for p in crypto_patterns) and days_until_close_val <= 30:
-        return 'CRYPTO_SHORT'
+    if any(p in title_lower for p in crypto_patterns):
+        if days_until_close_val <= CRYPTO_MAX_HORIZON_DAYS:
+            return 'CRYPTO_SHORT'
+        else:
+            return 'JUNK'  # crypto >2 days = too uncertain
 
     # ── COMMODITY — gold, silver, oil, S&P futures (ticker-based, date-limited) ──
     commodity_tickers_cls = [
@@ -2297,6 +2413,23 @@ def score_and_rank_markets(
                 play["direction"] = econ_dir
                 if abs(econ_edge) > 0.10:
                     play["composite"] = play.get("composite", 0) + abs(econ_edge) * tier_mult
+
+                # WTI-specific: apply EIA thesis direction filter
+                # Only trade in the direction supported by inventory data
+                if "KXWTI" in ticker.upper() or "KXBRENT" in ticker.upper():
+                    _oil_thesis = get_oil_thesis_direction()
+                    if _oil_thesis != "NEUTRAL":
+                        # BULLISH thesis: prefer YES (oil stays high) — block NO positions below threshold
+                        # BEARISH thesis: prefer NO (oil won't spike) — block YES positions above threshold
+                        _direction_ok = (
+                            (_oil_thesis == "BULLISH" and econ_dir == "YES") or
+                            (_oil_thesis == "BEARISH" and econ_dir == "NO") or
+                            True  # neutral = allow both
+                        )
+                        if not _direction_ok:
+                            log.info("[EIA] Blocking %s %s — EIA thesis is %s", econ_dir, ticker, _oil_thesis)
+                            play["composite"] = 0  # zero out composite so selector won't pick it
+
                 log.info(f"[CommodityEdge] Wired {ticker}: model={model_prob:.0%} kalshi={mid:.0%} edge={econ_edge:+.2f} → {econ_dir}")
 
         # Feature 7: Order book depth analysis
@@ -2341,6 +2474,11 @@ def score_and_rank_markets(
             f"velocity={play['velocity_label']}"
         )
         plays.append(play)
+        # Log signal for replay engine
+        try:
+            log_signal(play)
+        except Exception:
+            pass
         time.sleep(0.1)
 
     # Include weather-signal markets not already in candidates
@@ -2599,6 +2737,62 @@ def calculate_contracts(signal: dict, balance: float) -> int:
     contracts = max(1, math.floor(spend / price_dollars))
     return contracts
 
+
+def log_signal(play: dict, scan_ts: str = None):
+    """
+    Log every scored market signal to data/signals.jsonl for replay analysis.
+    Called once per scored play in score_and_rank_markets().
+    Fields needed by the replay engine: model_p, market_p, edge, buffer, close_time, asset_class.
+    """
+    import json as _json
+    from pathlib import Path as _Path
+    from datetime import datetime as _dt, timezone as _tz
+
+    try:
+        sig_path = _Path("/home/cody/stratton/data/signals.jsonl")
+        sig_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Rotate if > 50MB
+        if sig_path.exists() and sig_path.stat().st_size > 52428800:
+            sig_path.rename(str(sig_path) + ".old")
+
+        mid_c = play.get("mid_c", 50)
+        econ_edge = play.get("econ_edge", 0) or 0
+        market_p = mid_c / 100.0
+        model_p = min(0.99, market_p + abs(econ_edge))
+
+        # For crypto/commodity: pull edge directly from signal if econ_edge not set
+        _spot_price = play.get("spot_price", 0)
+        _threshold = play.get("threshold", 0)
+        _crypto_edge = play.get("edge", 0) or econ_edge  # crypto uses 'edge' field
+        _direction = play.get("direction", play.get("econ_direction", "YES"))
+
+        record = {
+            "ts":           scan_ts or _dt.now(_tz.utc).isoformat(),
+            "ticker":       play.get("ticker", ""),
+            "asset_class":  play.get("market_class", "UNKNOWN"),
+            "underlying":   play.get("ticker", "")[:8].replace("KX",""),
+            "direction":    _direction,
+            "mid_c":        mid_c,
+            "market_p":     round(market_p, 4),
+            "model_p":      round(min(0.99, market_p + abs(_crypto_edge)), 4),
+            "econ_edge":    round(float(_crypto_edge), 4),
+            "confidence":   round(float(play.get("confidence", 0)), 4),
+            "conf_label":   play.get("conf_label", "LOW"),
+            "composite":    round(float(play.get("composite_score", 0)), 6),
+            "close_time":   play.get("_market", {}).get("close_time", "") if play.get("_market") else "",
+            "days_to_close": play.get("days_until_close", 999),
+            "econ_source":  play.get("econ_source", ""),
+            "spot_price":   _spot_price,
+            "threshold":    _threshold,
+            "executed":     False,
+        }
+        with open(sig_path, "a") as _f:
+            _f.write(_json.dumps(record) + "\n")
+    except Exception as _e:
+        log.debug("[SignalLog] Failed to log signal: %s", _e)
+
+
 def _should_execute_inner(signal: dict, balance: float, positions: dict, total_exposure: float) -> tuple:
     """Check all guardrails. Returns (ok, reason). Never bypass."""
     ticker    = signal.get("ticker", "UNKNOWN")
@@ -2611,7 +2805,7 @@ def _should_execute_inner(signal: dict, balance: float, positions: dict, total_e
         return False, f"market resolves in {days_out} days (>90 day auto-exec limit)"
 
     # Only execute on categories where we have data model edge
-    EXECUTABLE_CATEGORIES = {"ECONOMIC_DATA"}  # CRYPTO + COMMODITY paused 2026-05-03 — strategy review 2026-05-03 — strategy review  # WEATHER is Mark Hanna/weather.py's domain
+    EXECUTABLE_CATEGORIES = {"ECONOMIC_DATA", "CRYPTO_SHORT", "COMMODITY"}  # 15M still paused — selector enforced  # WEATHER is Mark Hanna/weather.py's domain
     market_class = signal.get("market_class", "")
     if market_class not in EXECUTABLE_CATEGORIES:
         return False, f"category '{market_class}' is inform-only — no autonomous execution"
@@ -2719,6 +2913,20 @@ def _should_execute_inner(signal: dict, balance: float, positions: dict, total_e
     locked_direction = _get_active_thesis_locks().get(ticker)
     if locked_direction and direction.upper() != locked_direction:
         return False, f"thesis lock: {ticker} must be {locked_direction}, signal says {direction}"
+
+    # Hard dollar cap — never exceed $150 total exposure regardless of % of balance
+    if total_exposure >= EXEC_MAX_TOTAL_DOLLARS:
+        return False, ("total exposure $%.2f >= hard cap $%.2f" % (total_exposure, EXEC_MAX_TOTAL_DOLLARS))
+
+    # Per-underlying cap — max $30 per single asset (WTI separate from Gold separate from BTC)
+    _underlying = ticker.split("-")[0].replace("KX","") if "-" in ticker else ticker[:8]
+    _underlying_exp = sum(
+        float(p.get("market_exposure_dollars", 0) or 0)
+        for t, p in positions.items()
+        if t.split("-")[0].replace("KX","") == _underlying or _underlying in t.split("-")[0]
+    ) if positions else 0.0
+    if _underlying_exp >= EXEC_MAX_PER_UNDERLYING:
+        return False, ("underlying cap for %s: $%.2f >= $%.2f max" % (_underlying, _underlying_exp, EXEC_MAX_PER_UNDERLYING))
 
     total_balance = balance + total_exposure
     deployed_pct  = total_exposure / total_balance if total_balance > 0 else 0.0
@@ -2983,6 +3191,17 @@ def run_execution_check(plays: list, dry_run: bool = False):
     high_signals = [p for p in plays if p["confidence"] >= CONFIDENCE_HIGH_THRESHOLD]
     log.info(f"[EXEC] {len(high_signals)} HIGH confidence signals to evaluate")
 
+    # ── Selector import (cluster-based signal filtering) ─────────────────────
+    try:
+        import sys as _sys_sel
+        if '/home/cody/stratton/bots' not in _sys_sel.path:
+            _sys_sel.path.insert(0, '/home/cody/stratton/bots')
+        from selector import Signal as _Signal, SelectorParams as _SParams, select_from_cluster as _select, portfolio_gate as _pgate, OpenPosition as _OPos, PortfolioState as _PState, make_cluster_key as _cluster_key
+        _SELECTOR_AVAILABLE = True
+    except ImportError as _e:
+        log.warning("[Selector] selector.py not available: %s — running without cluster filter", _e)
+        _SELECTOR_AVAILABLE = False
+
     # CRYPTO TIER FILTER: For CRYPTO_SHORT markets, enforce 2-tier selection
     # (1 primary per close time + 1 global longshot) to prevent spray of positions.
     # Score = edge * kelly * payout_multiple. Select best per close time.
@@ -3026,11 +3245,72 @@ def run_execution_check(plays: list, dry_run: bool = False):
         _crypto_executed_closes.add(close_key)
         return True, "CRYPTO_SHORT PRIMARY tier (score=%.4f close=%s)" % (score, close_key)
 
+    # ── Selector cluster filter ──────────────────────────────────────────────
+    _selector_picks: set = set()  # set of market_ticker strings that selector approved
+    if _SELECTOR_AVAILABLE:
+        _sel_signals = []
+        for play in high_signals:
+            try:
+                _ticker = play.get("ticker", "")
+                _mc = play.get("market_class", "UNKNOWN")
+                _mid_c = play.get("mid_c", 50)
+                _price = _mid_c / 100.0
+                _edge = abs(play.get("econ_edge", 0) or 0)
+                _conf = play.get("confidence", 0.5)
+                _m = play.get("_market", {})
+                _close_str = _m.get("close_time", "") if _m else ""
+                _res_dt = None
+                if _close_str:
+                    try:
+                        _res_dt = datetime.fromisoformat(_close_str.replace("Z", "+00:00"))
+                    except Exception:
+                        pass
+                _hours = 999.0
+                if _res_dt:
+                    _hours = max(0.01, (_res_dt - datetime.now(timezone.utc)).total_seconds() / 3600)
+                _sig = _Signal(
+                    market_ticker=_ticker,
+                    asset_class=_mc,
+                    underlying=_ticker.split("-")[0].replace("KX",""),
+                    direction=play.get("direction", "YES"),
+                    price_cents=_mid_c,
+                    model_p=min(0.99, _price + _edge),
+                    market_p=_price,
+                    directional_edge=_edge,
+                    confidence=_conf,
+                    buffer_pct=max(0.001, _edge),
+                    resolution_dt=_res_dt,
+                    hours_to_resolution=_hours,
+                    proposed_size=play.get("proposed_size", 20.0) or 20.0,
+                )
+                _sel_signals.append(_sig)
+            except Exception as _se:
+                log.debug("[Selector] signal build failed for %s: %s", play.get("ticker","?"), _se)
+                _selector_picks.add(play.get("ticker",""))  # allow through if we can't build Signal
+
+        if _sel_signals:
+            _sel_params = _SParams()
+            _selected, _rejected = _select(_sel_signals, _sel_params)
+            _selector_picks = {s.market_ticker for s in _selected}
+            log.info("[Selector] %d signals -> %d selected, %d rejected by cluster filter",
+                     len(_sel_signals), len(_selected), len(_rejected))
+            for _r in _rejected:
+                log.info("[Selector] REJECTED %s: %s", _r.market_ticker, _r.rejection_reason)
+                log_skip(_r.market_ticker, "selector: " + (_r.rejection_reason or ""), {})
+    else:
+        # No selector available — allow all through (fallback to old behavior)
+        _selector_picks = {p.get("ticker","") for p in high_signals}
+
     for signal in high_signals:
         try:
             balance    = get_balance()
             positions  = get_open_positions()
             total_exp  = get_total_exposure(positions)
+            # Selector cluster filter — skip if not selected
+            if _SELECTOR_AVAILABLE and signal.get("ticker","") not in _selector_picks:
+                log.info("[Selector] %s filtered out by cluster selector", signal.get("ticker",""))
+                continue
+
             # Apply crypto tier filter before standard guardrails
             _allowed, _allow_reason = _crypto_allowed(signal)
             if not _allowed:
@@ -3101,6 +3381,27 @@ def run_execution_check(plays: list, dry_run: bool = False):
                 log.info(f"[EXEC] ✅ Executing {signal['ticker']}{' (DRY RUN)' if dry_run else ''}")
                 result = execute_trade(signal, dry_run=dry_run)
                 post_execution_result(signal, result, dry_run=dry_run)
+                # Mark this signal as executed in the signal log
+                try:
+                    import json as _jex
+                    from pathlib import Path as _pex
+                    _sp = _pex("/home/cody/stratton/data/signals.jsonl")
+                    if _sp.exists():
+                        _lines = _sp.read_text().splitlines()
+                        _ticker = signal.get("ticker","")
+                        _updated = []
+                        for _line in _lines:
+                            try:
+                                _rec = _jex.loads(_line)
+                                if _rec.get("ticker") == _ticker and not _rec.get("executed"):
+                                    _rec["executed"] = True
+                                    _line = _jex.dumps(_rec)
+                            except Exception:
+                                pass
+                            _updated.append(_line)
+                        _sp.write_text("\n".join(_updated) + "\n")
+                except Exception:
+                    pass
                 # ── Eval Framework: log trade at entry ────────────────────────
                 if result.get('status') not in ('failed', 'skipped'):
                     try:
@@ -3634,6 +3935,248 @@ def _market_resolves_within_hours(m: dict, hours: int = 24) -> bool:
     except Exception:
         return False
 
+
+
+def fetch_btc_intraday_vol(symbol: str = "BTC") -> dict:
+    """
+    Fetch last 6 hourly OHLCV candles from Binance public API.
+    Compute intraday realized volatility as std dev of log returns.
+    
+    Returns dict:
+        current_vol_pct: float  -- current session hourly vol as % (annualized basis)
+        candles: int            -- number of candles used
+        session_trend: str      -- "UP" | "DOWN" | "FLAT" based on last 3 candles
+        source: str
+    """
+    try:
+        import math as _math
+        # Use Kraken public OHLCV API (no geo-restrictions, no auth)
+        pair = "XBTUSD" if symbol == "BTC" else "ETHUSD"
+        r = requests.get(
+            "https://api.kraken.com/0/public/OHLC",
+            params={"pair": pair, "interval": 60},  # 60 = 1 hour
+            timeout=8,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        if not r.ok:
+            return {"current_vol_pct": 1.9, "candles": 0, "session_trend": "FLAT", "source": "fallback"}
+        
+        data = r.json()
+        if data.get("error"):
+            return {"current_vol_pct": 1.9, "candles": 0, "session_trend": "FLAT", "source": "fallback"}
+        
+        # Kraken OHLC: [time, open, high, low, close, vwap, volume, count]
+        result_key = list(data.get("result", {}).keys())[0] if data.get("result") else None
+        if not result_key:
+            return {"current_vol_pct": 1.9, "candles": 0, "session_trend": "FLAT", "source": "fallback"}
+        
+        candles_raw = data["result"][result_key][-8:]  # last 8 candles
+        if len(candles_raw) < 4:
+            return {"current_vol_pct": 1.9, "candles": 0, "session_trend": "FLAT", "source": "fallback"}
+        
+        closes = [float(c[4]) for c in candles_raw[:-1]]  # exclude current open candle
+        log_returns = [_math.log(closes[i]/closes[i-1]) for i in range(1, len(closes))]
+        
+        import statistics as _stats
+        if len(log_returns) >= 2:
+            hourly_vol = _stats.stdev(log_returns)
+            # Annualize: hourly -> daily -> annualized
+            daily_vol_pct = hourly_vol * _math.sqrt(24) * 100
+        else:
+            daily_vol_pct = 1.9  # fallback
+        
+        # Session trend: compare last close to 3 candles ago
+        if len(closes) >= 4:
+            pct_change = (closes[-1] - closes[-4]) / closes[-4] * 100
+            session_trend = "UP" if pct_change > 0.3 else ("DOWN" if pct_change < -0.3 else "FLAT")
+        else:
+            session_trend = "FLAT"
+        
+        log.info("[IntradayVol] %s: daily_vol=%.2f%% session=%s (%d candles)",
+                 symbol, daily_vol_pct, session_trend, len(closes))
+        return {
+            "current_vol_pct": round(daily_vol_pct, 3),
+            "candles": len(closes),
+            "session_trend": session_trend,
+            "source": "Binance/1h",
+        }
+    except Exception as e:
+        log.debug("[IntradayVol] fetch failed: %s", e)
+        return {"current_vol_pct": 1.9, "candles": 0, "session_trend": "FLAT", "source": "fallback"}
+
+# Cache intraday vol — 30 min TTL (refreshes before each scan cycle)
+_intraday_vol_cache: dict = {}
+_intraday_vol_ts: float = 0.0
+
+def get_btc_intraday_vol(symbol: str = "BTC") -> dict:
+    global _intraday_vol_cache, _intraday_vol_ts
+    now = time.time()
+    cache_key = symbol
+    if _intraday_vol_cache.get(cache_key) and (now - _intraday_vol_ts) < 1800:
+        return _intraday_vol_cache[cache_key]
+    result = fetch_btc_intraday_vol(symbol)
+    _intraday_vol_cache[cache_key] = result
+    _intraday_vol_ts = now
+    return result
+
+
+def crypto_horizon_buffer_check(ticker: str, spot: float, threshold: float, 
+                                  close_time_str: str) -> tuple:
+    """
+    Enforce horizon-scaled minimum buffer for crypto range markets.
+    Longer horizon = more buffer required because BTC can move more.
+    
+    Returns (passes: bool, reason: str, required_buffer: float)
+    
+    Rules:
+      - >2 days: BLOCKED (too uncertain for directional thesis)
+      - 1-2 days: 2.0% min buffer
+      - 0-1 days: 0.5% min buffer
+    """
+    import math
+    actual_buffer = abs(spot - threshold) / max(threshold, 1)
+    
+    hours_to_close = 999.0
+    if close_time_str:
+        try:
+            ct = datetime.fromisoformat(close_time_str.replace("Z", "+00:00"))
+            hours_to_close = max(0.01, (ct - datetime.now(timezone.utc)).total_seconds() / 3600)
+        except Exception:
+            pass
+    
+    days_to_close = hours_to_close / 24.0
+    
+    # Block positions >2 days out entirely
+    if days_to_close > CRYPTO_MAX_HORIZON_DAYS:
+        return False, ("horizon block: %.1f days > %d day max for crypto range markets" % (
+            days_to_close, CRYPTO_MAX_HORIZON_DAYS)), 1.0
+    
+    # Scale buffer requirement: 2 * daily_vol * sqrt(days)
+    # Floor at 0.5% for same-day, 2.0% for 1-2 day
+    # Use current intraday vol if available — adapts to market conditions
+    _sym = "BTC" if "BTC" in ticker.upper() else "ETH"
+    _vol_data = get_btc_intraday_vol(_sym)
+    _current_daily_vol = _vol_data.get("current_vol_pct", 1.9) / 100.0
+    _session_trend = _vol_data.get("session_trend", "FLAT")
+
+    if days_to_close <= 1.0:
+        # Same-day: use current vol. High vol session = wider buffer required
+        if _current_daily_vol > 0.025:  # >2.5% daily vol = elevated
+            required_buffer = _current_daily_vol * 0.5  # 50% of daily vol as buffer
+        else:
+            required_buffer = 0.005  # 0.5% standard
+    else:
+        # Multi-day: scale by sqrt(days) using current vol
+        import math as _mth
+        required_buffer = 1.5 * _current_daily_vol * _mth.sqrt(days_to_close)
+        required_buffer = max(0.020, required_buffer)  # floor at 2.0% for multi-day
+    
+    if actual_buffer < required_buffer:
+        return False, ("buffer %.3f%% < %.3f%% required for %.1fd horizon" % (
+            actual_buffer * 100, required_buffer * 100, days_to_close)), required_buffer
+    
+    return True, "ok", required_buffer
+
+
+
+def update_btc_price_history(symbol: str = "BTC") -> dict:
+    """
+    Lightweight BTC price tracker. Called every 5 min by btc_watch scanner.
+    Checks three conditions for triggering a full Kalshi crypto scan:
+      1. Price moved >1.0% in last 15 min (last 3 readings)
+      2. Intraday vol > 1.5%
+      3. Kraken hourly volume > 1.2x 6-candle average
+    Sets _btc_scan_triggered flag if all three conditions met.
+    """
+    global _btc_price_history, _btc_scan_triggered, _btc_last_trigger_reason
+
+    # Fetch current spot price
+    spot_data = get_crypto_spot()
+    price = 0.0
+    if isinstance(spot_data, dict):
+        sym_data = spot_data.get(symbol, {})
+        if isinstance(sym_data, dict):
+            price = float(sym_data.get("price", 0))
+        elif isinstance(sym_data, (int, float)):
+            price = float(sym_data)
+
+    if price <= 0:
+        log.warning("[BTC_WATCH] Could not fetch %s spot price", symbol)
+        return {"price": 0, "pct_change_15m": 0, "vol_pct": 0, "vol_ratio": 0, "triggered": False}
+
+    now = datetime.now(timezone.utc)
+    _btc_price_history.append((now, price))
+    # Keep only last 12 readings (1 hour at 5-min intervals)
+    if len(_btc_price_history) > 12:
+        _btc_price_history = _btc_price_history[-12:]
+
+    # ── Condition 1: price move >1.0% in last 15 min (last 3 readings) ──
+    pct_change_15m = 0.0
+    cond1 = False
+    if len(_btc_price_history) >= 3:
+        price_15m_ago = _btc_price_history[-3][1]
+        if price_15m_ago > 0:
+            pct_change_15m = (price - price_15m_ago) / price_15m_ago * 100
+            cond1 = abs(pct_change_15m) > 1.0
+    elif len(_btc_price_history) >= 2:
+        price_prev = _btc_price_history[-2][1]
+        if price_prev > 0:
+            pct_change_15m = (price - price_prev) / price_prev * 100
+
+    # ── Condition 2: intraday vol > 1.5% ──
+    vol_pct = 0.0
+    cond2 = False
+    try:
+        vol_data = get_btc_intraday_vol(symbol)
+        vol_pct = vol_data.get("current_vol_pct", 0.0)
+        cond2 = vol_pct > 1.5
+    except Exception as e:
+        log.warning("[BTC_WATCH] Vol check failed: %s", e)
+
+    # ── Condition 3: Kraken hourly volume > 1.2x 6-candle average ──
+    vol_ratio = 0.0
+    cond3 = False
+    try:
+        kraken_url = "https://api.kraken.com/0/public/OHLC?pair=XBTUSD&interval=60&limit=7"
+        resp = requests.get(kraken_url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        # Kraken OHLC: result[pair] = list of [time, open, high, low, close, vwap, volume, count]
+        pair_key = next((k for k in data.get("result", {}) if k != "last"), None)
+        if pair_key:
+            candles = data["result"][pair_key]
+            # candles[-1] is current (incomplete), candles[:-1] are closed
+            if len(candles) >= 7:
+                closed_volumes = [float(c[6]) for c in candles[:-1]]  # last 6 closed candles
+                current_volume = float(candles[-1][6])
+                avg_volume = sum(closed_volumes) / len(closed_volumes) if closed_volumes else 0
+                if avg_volume > 0:
+                    vol_ratio = current_volume / avg_volume
+                    cond3 = vol_ratio > 1.2
+    except Exception as e:
+        log.warning("[BTC_WATCH] Kraken volume check failed: %s", e)
+
+    log.info("[BTC_WATCH] %s=$%.0f pct15m=%+.2f%% vol=%.2f%% vol_ratio=%.2fx | C1=%s C2=%s C3=%s",
+             symbol, price, pct_change_15m, vol_pct, vol_ratio, cond1, cond2, cond3)
+
+    triggered = cond1 and cond2 and cond3
+    reason = ""
+    if triggered:
+        reason = f"BTC {pct_change_15m:+.1f}% in 15min, vol={vol_pct:.1f}%, vol_ratio={vol_ratio:.2f}x"
+        _btc_scan_triggered = True
+        _btc_last_trigger_reason = reason
+        log.info("[BTC_WATCH] *** MOMENTUM SIGNAL: %s ***", reason)
+
+    return {
+        "price": price,
+        "pct_change_15m": round(pct_change_15m, 3),
+        "vol_pct": round(vol_pct, 2),
+        "vol_ratio": round(vol_ratio, 3),
+        "triggered": triggered,
+        "reason": reason,
+    }
+
+
 def run_crypto_monitor(dry_run: bool = False) -> dict:
     """
     Module 2: Real-time crypto price monitor.
@@ -3685,30 +4228,46 @@ def run_crypto_monitor(dry_run: bool = False) -> dict:
         crypto_signals = new_crypto_signals
         return crypto_signals
 
-    # MOMENTUM TRIGGER: only scan if BTC/ETH moved >0.5% since last scan
-    global _prev_btc_spot, _prev_eth_spot
-    btc_now = spot.get("BTC", {}).get("price", 0) if isinstance(spot.get("BTC"), dict) else next((d["price"] for s,d in spot.items() if s=="BTC"), 0)
-    eth_now = spot.get("ETH", {}).get("price", 0) if isinstance(spot.get("ETH"), dict) else next((d["price"] for s,d in spot.items() if s=="ETH"), 0)
-    # spot dict has format {sym: {"price": x, ...}}
+    # MOMENTUM TRIGGER: BTC_WATCH sets flag OR apply three-condition gate
+    global _prev_btc_spot, _prev_eth_spot, _btc_scan_triggered, _btc_last_trigger_reason
     btc_now = spot.get("BTC", {}).get("price", 0)
     eth_now = spot.get("ETH", {}).get("price", 0)
-    btc_moved = abs(btc_now - _prev_btc_spot) / max(_prev_btc_spot, 1) if _prev_btc_spot > 0 else 1.0
-    eth_moved = abs(eth_now - _prev_eth_spot) / max(_prev_eth_spot, 1) if _prev_eth_spot > 0 else 1.0
-    btc_direction = 1 if btc_now >= _prev_btc_spot else -1
-    eth_direction = 1 if eth_now >= _prev_eth_spot else -1
 
-    if _prev_btc_spot > 0 and btc_moved < BTC_MOMENTUM_THRESHOLD and eth_moved < BTC_MOMENTUM_THRESHOLD:
-        log.info("[Crypto] No momentum signal (BTC %+.3f%%, ETH %+.3f%%) — skipping edge scan",
-                 btc_moved*100, eth_moved*100)
-        _prev_btc_spot = btc_now
-        _prev_eth_spot = eth_now
-        crypto_signals = new_crypto_signals
-        return crypto_signals
+    # Check if scan was triggered by price watcher (already validated 3 conditions)
+    # OR fall back to basic momentum check for regular :15/:45 scans
+    if _btc_scan_triggered:
+        log.info("[Crypto] BTC_WATCH triggered scan: %s", _btc_last_trigger_reason)
+        _btc_scan_triggered = False  # consume the trigger
+        # Already confirmed conditions — proceed
+        btc_direction = 1 if btc_now >= _prev_btc_spot else -1
+        eth_direction = 1 if eth_now >= _prev_eth_spot else -1
+    else:
+        # Regular scheduled scan: apply three-condition gate
+        btc_moved = abs(btc_now - _prev_btc_spot) / max(_prev_btc_spot, 1) if _prev_btc_spot > 0 else 1.0
+        eth_moved = abs(eth_now - _prev_eth_spot) / max(_prev_eth_spot, 1) if _prev_eth_spot > 0 else 1.0
+        btc_direction = 1 if btc_now > _prev_btc_spot else -1
+        eth_direction = 1 if eth_now > _prev_eth_spot else -1
 
-    if _prev_btc_spot > 0:
-        log.info("[Crypto] Momentum: BTC %+.3f%% %s | ETH %+.3f%% %s",
-                 btc_moved*100, "UP" if btc_direction>0 else "DN",
-                 eth_moved*100, "UP" if eth_direction>0 else "DN")
+        # Condition 1: minimum move
+        if _prev_btc_spot > 0 and btc_moved < BTC_MOMENTUM_THRESHOLD and eth_moved < BTC_MOMENTUM_THRESHOLD:
+            log.info("[Crypto] No momentum signal (BTC %+.3f%%, ETH %+.3f%%) — skipping", btc_moved*100, eth_moved*100)
+            _prev_btc_spot = btc_now
+            _prev_eth_spot = eth_now
+            crypto_signals = new_crypto_signals
+            return crypto_signals
+
+        # Condition 2: vol confirmation
+        _vol_data = get_btc_intraday_vol("BTC")
+        _current_vol = _vol_data.get("current_vol_pct", 1.9)
+        if _current_vol < 1.2 and _prev_btc_spot > 0:
+            log.info("[Crypto] Vol too low (%.2f%% < 1.2%%) — skipping low-vol noise", _current_vol)
+            _prev_btc_spot = btc_now
+            _prev_eth_spot = eth_now
+            crypto_signals = new_crypto_signals
+            return crypto_signals
+
+        log.info("[Crypto] Momentum confirmed: BTC %+.3f%% vol=%.2f%%", btc_moved*100, _current_vol)
+
     _prev_btc_spot = btc_now
     _prev_eth_spot = eth_now
 
@@ -3760,15 +4319,13 @@ def run_crypto_monitor(dry_run: bool = False) -> dict:
         if edge > EXEC_MIN_EDGE_DOLLARS:
             side = "YES" if spot_prob > kalshi_mid else "NO"
 
-            # BUFFER CHECK — enforce 0.5% minimum between spot and threshold
-            # This is the same guardrail as in calculate_crypto_edge() / should_execute()
-            # Without this check, thin-buffer markets slip through this parallel path
-            buffer_pct = abs(spot_price - threshold) / threshold
-            if buffer_pct < 0.005:
-                log.info(
-                    "[Crypto] %s: buffer %.3f%% < 0.5%% minimum — skipping signal",
-                    ticker, buffer_pct * 100
-                )
+            # HORIZON-SCALED BUFFER CHECK
+            # Longer horizon needs more buffer. >2 days = blocked entirely.
+            _ct_str = m.get("close_time", "")
+            _buf_ok, _buf_reason, _buf_req = crypto_horizon_buffer_check(
+                ticker, spot_price, threshold, _ct_str)
+            if not _buf_ok:
+                log.info("[Crypto] %s: %s", ticker, _buf_reason)
                 continue
 
             # 30-MIN EXPIRY CHECK — same as should_execute() guardrail
